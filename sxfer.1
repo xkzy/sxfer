@@ -1,6 +1,6 @@
-.TH SXFER 1 "2026-10-05" "sxfer" "User Commands"
+.TH SXFER 1 "2026-10-05" "sxfer 2.0.0" "User Commands"
 .SH NAME
-sxfer \- high-speed, one-way serial file tree transfer using fast-lzma2, RaptorQ fountain coding, and baseband line coding
+sxfer \- high-speed, one-way serial file tree transfer using concatenated SC-LDPC, RaptorQ fountain coding, and LZMA2
 .SH SYNOPSIS
 .B sxfer send
 .RI [ options ]
@@ -17,24 +17,26 @@ copies complete directory hierarchies and file trees across a one-way (simplex /
 (such as USB-to-UART, RS-485, optical isolators, or unidirectional data diodes).
 There is no reverse channel, no ACKs/NACKs, and no backpressure handshake.
 .PP
-To ensure maximum throughput, zero transmission gaps, and robust erasure recovery,
+To ensure maximum throughput, zero transmission gaps, and robust erasure recovery under extreme channel noise,
 .B sxfer
 integrates:
 .IP \(bu 2
-\fBMulti-Threaded fast-lzma2 Compression\fR: Parallel multithreaded dictionary compression.
+\fB100% Pure Rust & Static Musl Architecture\fR: Zero C runtime dependencies; compiled as a single standalone static binary.
 .IP \(bu 2
-\fBRateless Fountain Coding (RFC 6330 RaptorQ / Systematic Codes over GF(256))\fR: Files are partitioned into source blocks of up to 128 symbols. Systematic symbols are transmitted with zero overhead, followed by an endless stream of independent repair symbols. Receiving any (1 + \(*e) symbols allows complete reconstruction via full-pivoting Gaussian elimination over GF(256).
+\fBInner Rate 2/3 SC-QC-LDPC FEC\fR: Quasi-Cyclic Spatially-Coupled Low-Density Parity-Check codes with Belief Propagation and anti-oscillation momentum, correcting 5\(en10% Bit Error Rate (BER).
 .IP \(bu 2
-\fBBaud-Adaptive Dynamic Chunk Sizing\fR: Chunks scale dynamically with baud rate (1 KiB for <500k baud, 4 KiB for 500k\(en2.5M baud, and 16 KiB for \(>=2.5M baud) to minimize kernel context switch overhead.
+\fBOuter Rateless Fountain Coding (RaptorQ over GF(256))\fR: Systematic fountain encoding with multi-block interleaving, recovering from packet drop rates exceeding 80%.
 .IP \(bu 2
-\fBContinuous 3-Stage Streaming Pipeline\fR: Disk reader/compressor, RaptorQ fountain encoder, and 64 KiB batched zero-copy serial TX operate concurrently with thread-safe ring buffering, saturating UART TX FIFOs at 100%.
+\fBHigh-Ratio LZMA2 Stream Compression\fR: Integrated pure-Rust dictionary compression.
+.IP \(bu 2
+\fBWatch Directory Spooling (\-w DIR)\fR: Continuous filesystem monitoring with automatic debouncing, queuing, transmission, and post-transfer cleanup.
 .IP \(bu 2
 \fBBaseband Line Coding & Framing\fR: Consistent Overhead Byte Stuffing (COBS) with 0x00 frame boundaries and Galois LFSR whitening to prevent bit stuffing loss and clock drift.
 .PP
 .B sxfer send
 walks each
 .IR PATH ,
-compresses files using fast-lzma2, encodes fountain symbols, and streams frames through the pipeline.
+compresses files using LZMA2, encodes fountain symbols and SC-LDPC frames, and streams them through the pipeline.
 Paths are transmitted relative to the working directory.
 .PP
 .B sxfer recv
@@ -77,11 +79,11 @@ Number of transmission rounds (default
 .BR 2 ).
 .TP
 .BI \-z " LEVEL"
-fast-lzma2 compression level:
+LZMA2 compression level:
 .B 0
 for uncompressed,
 .B 1\(en9
-for fast-lzma2 dictionary levels (default
+for LZMA2 dictionary levels (default
 .BR 6 ).
 .TP
 .BI \-l " FILE"
