@@ -9,9 +9,10 @@ mod serial;
 
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -25,6 +26,7 @@ use raptorq::{RaptorQDecoder, RaptorQEncoder};
 use serial::{auto_chunk_size, flush_tty, open_line_recv, open_line_send};
 
 static STOP_FLAG: AtomicBool = AtomicBool::new(false);
+static TRANSFER_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn logmsg(msg: &str) {
     let now = SystemTime::now()
@@ -40,6 +42,18 @@ struct Timespec {
     tv_nsec: i64,
 }
 
+#[repr(C)]
+struct PollFd {
+    fd: std::os::raw::c_int,
+    events: std::os::raw::c_short,
+    revents: std::os::raw::c_short,
+}
+
+const POLLIN: std::os::raw::c_short = 0x0001;
+const LOCK_EX: std::os::raw::c_int = 2;
+const LOCK_NB: std::os::raw::c_int = 4;
+const LOCK_UN: std::os::raw::c_int = 8;
+
 extern "C" {
     fn geteuid() -> u32;
     fn chown(path: *const std::os::raw::c_char, owner: u32, group: u32) -> std::os::raw::c_int;
@@ -50,6 +64,21 @@ extern "C" {
         times: *const Timespec,
         flags: std::os::raw::c_int,
     ) -> std::os::raw::c_int;
+    fn signal(signum: std::os::raw::c_int, handler: extern "C" fn(std::os::raw::c_int)) -> usize;
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
+    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+extern "C" fn sig_handler(_: std::os::raw::c_int) {
+    STOP_FLAG.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    unsafe {
+        signal(2, sig_handler);  // SIGINT (Ctrl-C)
+        signal(15, sig_handler); // SIGTERM
+        signal(1, sig_handler);  // SIGHUP
+    }
 }
 
 // ----------------------------------------------------------------- SENDER PIPELINE
@@ -74,13 +103,21 @@ struct QueueItem {
 }
 
 fn generate_id(rel: &str) -> [u8; 8] {
+    let nonce = TRANSFER_NONCE.fetch_add(1, Ordering::Relaxed);
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
     let mut crc1 = Crc32::new();
     crc1.update(rel.as_bytes());
+    crc1.update(&nonce.to_be_bytes());
     let h1 = crc1.finalize();
 
     let mut crc2 = Crc32::new();
-    crc2.update(b"sxfer_seed_2026");
+    crc2.update(b"sxfer_nonce_2026");
     crc2.update(rel.as_bytes());
+    crc2.update(&now_ns.to_be_bytes());
     let h2 = crc2.finalize();
 
     let mut id = [0u8; 8];
@@ -848,7 +885,65 @@ fn send_batch(
     Ok(())
 }
 
+fn is_file_ready_to_send(path: &Path) -> bool {
+    let meta1 = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    if meta1.file_type().is_symlink() {
+        return true;
+    }
+
+    if meta1.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if !is_file_ready_to_send(&entry.path()) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Regular file:
+    // 1. Check non-blocking flock to see if writing process holds an exclusive lock
+    if let Ok(f) = OpenOptions::new().read(true).open(path) {
+        let fd = f.as_raw_fd();
+        let lock_res = unsafe { flock(fd, LOCK_EX | LOCK_NB) };
+        if lock_res != 0 {
+            return false;
+        }
+        unsafe { flock(fd, LOCK_UN); }
+    } else {
+        return false;
+    }
+
+    // 2. Measure size and timestamp stability over 250ms debounce
+    let size1 = meta1.len();
+    let mt_s1 = meta1.mtime();
+    let mt_ns1 = meta1.mtime_nsec();
+
+    thread::sleep(Duration::from_millis(250));
+
+    let meta2 = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    let size2 = meta2.len();
+    let mt_s2 = meta2.mtime();
+    let mt_ns2 = meta2.mtime_nsec();
+
+    if size1 != size2 || mt_s1 != mt_s2 || mt_ns1 != mt_ns2 {
+        return false;
+    }
+
+    true
+}
+
 fn do_send(args: &[String]) -> Result<(), String> {
+    install_signal_handlers();
     let mut dev = "/dev/ttyUSB0".to_string();
     let mut baud = 115200u64;
     let mut rounds = 1usize;
@@ -922,20 +1017,19 @@ fn do_send(args: &[String]) -> Result<(), String> {
                 continue;
             }
 
-            // Brief settle debounce so partially written files are not read prematurely
-            thread::sleep(Duration::from_millis(200));
-
-            // Re-read to ensure stable list
-            entries = match fs::read_dir(&wdir) {
-                Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
-                Err(_) => Vec::new(),
-            };
             entries.sort();
 
             for entry in entries {
                 if !entry.exists() {
                     continue;
                 }
+
+                // If file is actively being written by another process, wait until writing is finished
+                if !is_file_ready_to_send(&entry) {
+                    logmsg(&format!("WATCH waiting for file to finish writing: {}", entry.display()));
+                    continue;
+                }
+
                 logmsg(&format!("WATCH processing: {}", entry.display()));
                 if let Err(e) = send_batch(vec![entry.clone()], &mut file, chunk_size, level, mod_mode, pct, rounds) {
                     logmsg(&format!("ERROR sending {}: {}", entry.display(), e));
@@ -950,6 +1044,8 @@ fn do_send(args: &[String]) -> Result<(), String> {
                 }
                 logmsg(&format!("SENT & DELETED {}", entry.display()));
             }
+
+            thread::sleep(Duration::from_millis(150));
         }
 
         logmsg("WATCH stopped");
@@ -968,6 +1064,7 @@ fn do_send(args: &[String]) -> Result<(), String> {
 
 
 fn do_recv(args: &[String]) -> Result<(), String> {
+    install_signal_handlers();
     let mut dev = "/dev/ttyUSB0".to_string();
     let mut baud = 115200u64;
     let mut out_dir = PathBuf::from("./recv");
@@ -990,7 +1087,7 @@ fn do_recv(args: &[String]) -> Result<(), String> {
                            -b BAUD   baud rate (default 115200)\n\
                            -o DIR    output directory (default ./recv)\n\
                            -m MODE   cobs, scramble, raw (default cobs)\n\
-                           -q SEC    quit SEC seconds after quiet\n\
+                           -q SEC    quit SEC seconds after quiet (default: 0 = loop indefinitely)\n\
                            -p        restore owner/group (requires root)");
                 return Ok(());
             }
@@ -1015,9 +1112,41 @@ fn do_recv(args: &[String]) -> Result<(), String> {
     let mut last_activity = Instant::now();
     let mut started = false;
 
+    let raw_fd = file.as_raw_fd();
+    let mut pfd = PollFd {
+        fd: raw_fd,
+        events: POLLIN,
+        revents: 0,
+    };
+
     while !STOP_FLAG.load(Ordering::Relaxed) {
+        let poll_timeout = if idle_sec > 0 { 200 } else { 500 };
+        let ret = unsafe { poll(&mut pfd, 1, poll_timeout) };
+        if STOP_FLAG.load(Ordering::Relaxed) {
+            break;
+        }
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            logmsg(&format!("poll error: {}", err));
+            break;
+        }
+        if ret == 0 {
+            if idle_sec > 0 && started && last_activity.elapsed().as_secs() >= idle_sec {
+                break;
+            }
+            continue;
+        }
+
         match file.read(&mut read_buf) {
-            Ok(0) => break, // EOF
+            Ok(0) => {
+                if idle_sec > 0 && started && last_activity.elapsed().as_secs() >= idle_sec {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
             Ok(n) => {
                 started = true;
                 last_activity = Instant::now();
@@ -1067,7 +1196,12 @@ fn do_recv(args: &[String]) -> Result<(), String> {
                     }
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if STOP_FLAG.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if idle_sec > 0 && started && last_activity.elapsed().as_secs() >= idle_sec {
                     break;

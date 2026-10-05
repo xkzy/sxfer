@@ -46,6 +46,9 @@ test-regression: $(BIN)
 test-watch: $(BIN)
 	bash test/test_watch_mode.sh
 
+test-writer: $(BIN)
+	bash test/test_slow_writer.sh
+
 
 install: $(BIN) $(MAN1)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)

@@ -113,10 +113,21 @@ pub fn open_line_send(path: &Path, baud: u64) -> std::io::Result<File> {
 }
 
 pub fn open_line_recv(path: &Path, baud: u64) -> std::io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(0o0400) // O_NOCTTY
-        .open(path)?;
+    let is_fifo = std::fs::metadata(path)
+        .map(|m| {
+            use std::os::unix::fs::FileTypeExt;
+            m.file_type().is_fifo()
+        })
+        .unwrap_or(false);
+
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    if is_fifo {
+        // Open FIFO with read+write so it does not EOF when external writers disconnect
+        opts.write(true);
+    }
+    opts.custom_flags(0o0400); // O_NOCTTY
+    let file = opts.open(path)?;
 
     configure_tty(file.as_raw_fd(), baud)?;
     Ok(file)
