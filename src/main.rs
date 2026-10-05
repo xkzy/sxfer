@@ -7,6 +7,8 @@ mod lzma2;
 mod mod_codec;
 mod raptorq;
 mod serial;
+mod service;
+mod tray_windows;
 
 
 use std::collections::HashMap;
@@ -27,7 +29,7 @@ use serial::{auto_chunk_size, flush_tty, open_line_recv, open_line_send};
 static STOP_FLAG: AtomicBool = AtomicBool::new(false);
 static TRANSFER_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn logmsg(msg: &str) {
+pub fn logmsg(msg: &str) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1042,9 +1044,21 @@ mod hex {
 // ----------------------------------------------------------------- CLI & MAIN
 fn print_usage(prog: &str) {
     eprintln!(
-        "Usage: {} send [opts] PATH...   |   {} recv [opts]   |   {} crc FILE\n\
-         (use 'send -h' or 'recv -h' for options)",
-        prog, prog, prog
+        "sxfer v2.0 - High-Speed Unidirectional Serial File Transfer\n\n\
+        Usage:\n  \
+          {prog} send -d DEV [-b BAUD] [-r ROUNDS] [-w SPOOL_DIR | PATHS...]\n  \
+          {prog} recv -d DEV [-b BAUD] [-o OUT_DIR] [-q QUIET_SEC]\n  \
+          {prog} daemon [--config /path/to/sxfer.conf]\n  \
+          {prog} systemd install\n  \
+          {prog} tray [--config /path/to/sxfer.conf]\n  \
+          {prog} crc FILE\n\n\
+        Commands:\n  \
+          send      Transmit files or monitor watch directory\n  \
+          recv      Receive and verify files continuously\n  \
+          daemon    Run background daemon based on /etc/sxfer.conf\n  \
+          systemd   Install and enable systemd service unit\n  \
+          tray      Run Windows System Tray background service\n  \
+          crc       Compute and print standard CRC32 of a file"
     );
 }
 
@@ -1127,7 +1141,7 @@ fn is_file_ready_to_send(path: &Path) -> bool {
     true
 }
 
-fn do_send(args: &[String]) -> Result<(), String> {
+pub fn do_send(args: &[String]) -> Result<(), String> {
     install_signal_handlers();
     let mut dev = "/dev/ttyUSB0".to_string();
     let mut baud = 115200u64;
@@ -1246,7 +1260,7 @@ fn do_send(args: &[String]) -> Result<(), String> {
 }
 
 
-fn do_recv(args: &[String]) -> Result<(), String> {
+pub fn do_recv(args: &[String]) -> Result<(), String> {
     install_signal_handlers();
     let mut dev = "/dev/ttyUSB0".to_string();
     let mut baud = 115200u64;
@@ -1410,8 +1424,19 @@ fn do_recv(args: &[String]) -> Result<(), String> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        print_usage(&args[0]);
-        std::process::exit(1);
+        #[cfg(windows)]
+        {
+            if let Err(e) = tray_windows::run_tray_service(None) {
+                eprintln!("sxfer: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(windows))]
+        {
+            print_usage(&args[0]);
+            std::process::exit(1);
+        }
     }
 
     match args[1].as_str() {
@@ -1424,6 +1449,57 @@ fn main() {
         "recv" => {
             if let Err(e) = do_recv(&args[2..]) {
                 eprintln!("sxfer: {}", e);
+                std::process::exit(1);
+            }
+        }
+        "daemon" | "service" => {
+            let mut conf_path: Option<PathBuf> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--config" | "-c" => {
+                        i += 1;
+                        if let Some(p) = args.get(i) {
+                            conf_path = Some(PathBuf::from(p));
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if let Err(e) = service::run_daemon(conf_path.as_deref()) {
+                eprintln!("sxfer daemon: {}", e);
+                std::process::exit(1);
+            }
+        }
+        "systemd" => {
+            if args.len() >= 3 && args[2] == "install" {
+                if let Err(e) = service::install_systemd_service() {
+                    eprintln!("sxfer systemd install: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("Usage: {} systemd install", args[0]);
+                std::process::exit(1);
+            }
+        }
+        "tray" => {
+            let mut conf_path: Option<PathBuf> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--config" | "-c" => {
+                        i += 1;
+                        if let Some(p) = args.get(i) {
+                            conf_path = Some(PathBuf::from(p));
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if let Err(e) = tray_windows::run_tray_service(conf_path.as_deref()) {
+                eprintln!("sxfer tray: {}", e);
                 std::process::exit(1);
             }
         }
