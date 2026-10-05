@@ -457,9 +457,9 @@ fn encode_stage(
         hdr.extend_from_slice(link_bytes);
 
         let num_hdr_copies = if item.ftype == 'f' {
-            ((pct / 30) + 4).clamp(4, 24).max(rounds * 4)
+            ((pct / 15) + 8).clamp(8, 32).max(rounds * 8)
         } else {
-            ((pct / 20) + 6).clamp(6, 32).max(rounds * 6)
+            ((pct / 10) + 12).clamp(12, 48).max(rounds * 10)
         };
         for _ in 0..num_hdr_copies {
             let frame = mod_frame_encode(&hdr);
@@ -497,7 +497,7 @@ fn encode_stage(
                 }
             }
 
-            let end_copies = ((pct / 30) + 4).clamp(4, 24);
+            let end_copies = ((pct / 15) + 8).clamp(8, 32);
             for _ in 0..end_copies {
                 let end_hdr = mod_frame_encode(&hdr);
                 let _ = tx.send(end_hdr);
