@@ -147,4 +147,4 @@ make test-watch       # Watch Directory Spool & Auto-Purge Verification Suite
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+GNU3.0 License. See [LICENSE](LICENSE) for details.
