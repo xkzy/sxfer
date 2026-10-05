@@ -1,5 +1,6 @@
 //! sxfer - One-way, high-speed serial file tree transfer tool in Rust.
 
+mod config;
 mod crc32;
 mod ldpc;
 mod lzma2;
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crc32::{crc32_file, Crc32};
 use lzma2::{compress_lzma2, decompress_lzma2};
-use mod_codec::{mod_frame_decode, mod_frame_encode, ModMode, MAGIC_RAW};
+use mod_codec::{mod_frame_decode, mod_frame_encode};
 use raptorq::{RaptorQDecoder, RaptorQEncoder};
 use serial::{auto_chunk_size, flush_tty, open_line_recv, open_line_send};
 
@@ -129,9 +130,9 @@ fn generate_id(rel: &str) -> [u8; 8] {
 fn crawl_and_compress(
     paths: Vec<PathBuf>,
     chunk_size: usize,
-    compression_level: i32,
     tx: SyncSender<QueueItem>,
 ) {
+    const COMPRESSION_LEVEL: i32 = 9;
     for path in paths {
         let root = path.clone();
         let walker = walkdir(&path);
@@ -209,8 +210,8 @@ fn crawl_and_compress(
                 let mut payload = raw_data.clone();
                 let mut meth = 0u8;
 
-                if compression_level > 0 && !raw_data.is_empty() {
-                    if let Ok(compressed) = compress_lzma2(&raw_data, compression_level) {
+                if !raw_data.is_empty() {
+                    if let Ok(compressed) = compress_lzma2(&raw_data, COMPRESSION_LEVEL) {
                         if compressed.len() < raw_data.len() {
                             payload = compressed;
                             meth = 1;
@@ -226,7 +227,7 @@ fn crawl_and_compress(
                 if item.meth != 0 {
                     logmsg(&format!(
                         "QUEUED {} (f, {} B -> {} B fast-lzma2 L{}, {} symbols @ {} B)",
-                        item.rel_path, item.size, item.psize, compression_level, item.k, item.csz
+                        item.rel_path, item.size, item.psize, COMPRESSION_LEVEL, item.k, item.csz
                     ));
                 } else {
                     logmsg(&format!(
@@ -262,7 +263,6 @@ fn walkdir(dir: &Path) -> Vec<PathBuf> {
 fn encode_stage(
     rx: Receiver<QueueItem>,
     tx: SyncSender<Vec<u8>>,
-    mod_mode: ModMode,
     pct: usize,
     rounds: usize,
 ) {
@@ -282,7 +282,7 @@ fn encode_stage(
         hdr.extend_from_slice(&item.csz.to_be_bytes());
         hdr.extend_from_slice(&(pct as u16).to_be_bytes());
         hdr.push(item.meth);
-        hdr.push(6); // level
+        hdr.push(9); // level 9
         hdr.extend_from_slice(&item.fcrc.to_be_bytes());
 
         let rel_bytes = item.rel_path.as_bytes();
@@ -294,12 +294,12 @@ fn encode_stage(
         hdr.extend_from_slice(link_bytes);
 
         let num_hdr_copies = if item.ftype == 'f' {
-            ((pct / 50) + 2).clamp(2, 16).max(rounds * 2)
+            ((pct / 30) + 4).clamp(4, 24).max(rounds * 4)
         } else {
-            ((pct / 20) + 4).clamp(4, 24).max(rounds * 4)
+            ((pct / 20) + 6).clamp(6, 32).max(rounds * 6)
         };
         for _ in 0..num_hdr_copies {
-            let frame = mod_frame_encode(&hdr, mod_mode);
+            let frame = mod_frame_encode(&hdr);
             let _ = tx.send(frame);
         }
 
@@ -309,14 +309,14 @@ fn encode_stage(
                 let num_symbols = rq.total_symbols_to_send(pct);
                 let mut sym_buf = vec![0u8; item.csz as usize];
                 let mut pkt = Vec::with_capacity(16 + item.csz as usize);
-                let hdr_freq = if pct >= 200 { 8 } else { 16 };
+                let hdr_freq = if pct >= 100 { 4 } else if pct >= 50 { 8 } else { 16 };
 
 
                 for round in 0..rounds {
                     for s in 0..num_symbols {
                         let esi = (round * num_symbols + s) as u32;
                         if esi > 0 && (esi as usize % hdr_freq) == 0 {
-                            let mid_hdr = mod_frame_encode(&hdr, mod_mode);
+                            let mid_hdr = mod_frame_encode(&hdr);
                             let _ = tx.send(mid_hdr);
                         }
 
@@ -328,40 +328,51 @@ fn encode_stage(
                         pkt.extend_from_slice(&item.csz.to_be_bytes());
                         pkt.extend_from_slice(&sym_buf);
 
-                        let tx_frame = mod_frame_encode(&pkt, mod_mode);
+                        let tx_frame = mod_frame_encode(&pkt);
                         let _ = tx.send(tx_frame);
                     }
                 }
             }
 
-            let end_copies = ((pct / 50) + 2).clamp(2, 16);
+            let end_copies = ((pct / 30) + 4).clamp(4, 24);
             for _ in 0..end_copies {
-                let end_hdr = mod_frame_encode(&hdr, mod_mode);
+                let end_hdr = mod_frame_encode(&hdr);
                 let _ = tx.send(end_hdr);
             }
         }
     }
 }
 
-fn tx_worker(rx: Receiver<Vec<u8>>, mut file: File) {
-    let mut batch = Vec::with_capacity(65536);
-    while let Ok(pkt) = rx.recv() {
-        if batch.len() + pkt.len() > 65536 {
-            let _ = file.write_all(&batch);
-            batch.clear();
+fn tx_worker(rx: Receiver<Vec<u8>>, mut file: File, baud: u64) {
+    if baud >= 2_500_000 {
+        while let Ok(pkt) = rx.recv() {
+            for chunk in pkt.chunks(64) {
+                let _ = file.write_all(chunk);
+                thread::sleep(Duration::from_micros(150));
+            }
+            // Inter-frame line recovery time (allows UART to return to idle HIGH)
+            thread::sleep(Duration::from_micros(350));
         }
-        if pkt.len() > 65536 {
-            if !batch.is_empty() {
+    } else {
+        let mut batch = Vec::with_capacity(4096);
+        while let Ok(pkt) = rx.recv() {
+            if batch.len() + pkt.len() > 4096 {
                 let _ = file.write_all(&batch);
                 batch.clear();
             }
-            let _ = file.write_all(&pkt);
-        } else {
-            batch.extend_from_slice(&pkt);
+            if pkt.len() > 4096 {
+                if !batch.is_empty() {
+                    let _ = file.write_all(&batch);
+                    batch.clear();
+                }
+                let _ = file.write_all(&pkt);
+            } else {
+                batch.extend_from_slice(&pkt);
+            }
         }
-    }
-    if !batch.is_empty() {
-        let _ = file.write_all(&batch);
+        if !batch.is_empty() {
+            let _ = file.write_all(&batch);
+        }
     }
     flush_tty(&file);
 }
@@ -404,6 +415,13 @@ struct ReceiverContext {
     nok: usize,
     nbad: usize,
     ndone: usize,
+    sc_ldpc_bit_flips: usize,
+    sc_ldpc_frames_corrected: usize,
+    total_valid_frames: usize,
+    total_raw_bytes: u64,
+    total_wire_payload_bytes: u64,
+    total_symbols_received: usize,
+    total_symbols_needed: usize,
 }
 
 impl ReceiverContext {
@@ -416,6 +434,13 @@ impl ReceiverContext {
             nok: 0,
             nbad: 0,
             ndone: 0,
+            sc_ldpc_bit_flips: 0,
+            sc_ldpc_frames_corrected: 0,
+            total_valid_frames: 0,
+            total_raw_bytes: 0,
+            total_wire_payload_bytes: 0,
+            total_symbols_received: 0,
+            total_symbols_needed: 0,
         }
     }
 
@@ -535,6 +560,13 @@ impl ReceiverContext {
             logmsg(&format!("FAIL  {}: failed to write to disk", path));
             let _ = fs::remove_file(&tmp_path);
             return;
+        }
+
+        self.total_raw_bytes += size;
+        self.total_wire_payload_bytes += if meth != 0 { psize } else { size };
+        self.total_symbols_received += nsymbols as usize;
+        if let Some(f) = self.table.get(&id) {
+            self.total_symbols_needed += f.k as usize;
         }
 
         self.apply_meta(&dest, 'f', mode, uid, gid, mtime_sec, mtime_nsec);
@@ -796,10 +828,16 @@ impl ReceiverContext {
         }
     }
 
-    fn process_frame(&mut self, pay: &[u8]) {
+    fn process_frame(&mut self, pay: &[u8], bit_flips: usize) {
         if pay.len() < 8 {
             return;
         }
+        self.total_valid_frames += 1;
+        if bit_flips > 0 {
+            self.sc_ldpc_bit_flips += bit_flips;
+            self.sc_ldpc_frames_corrected += 1;
+        }
+
         if pay.len() >= 32 && (pay[8] == b'f' || pay[8] == b'd' || pay[8] == b'l') {
             self.on_header(pay);
         } else {
@@ -831,6 +869,25 @@ impl ReceiverContext {
             "SUMMARY {} file(s) verified, {} damaged frame(s) dropped, {} entries complete",
             self.nok, self.nbad, self.ndone
         ));
+
+        let lzma_savings = if self.total_raw_bytes > self.total_wire_payload_bytes {
+            format!("{:.1}% saved", (1.0 - (self.total_wire_payload_bytes as f64 / self.total_raw_bytes as f64)) * 100.0)
+        } else {
+            "0.0% (raw)".to_string()
+        };
+
+        logmsg(&format!(
+            "METRICS [Fast-LZMA2: {} B -> {} B ({})] [SC-LDPC: {} bit flips corrected across {} frames] [RaptorQ: {} symbols received / {} source symbols needed] [Framing: {} frames verified / {} dropped]",
+            self.total_raw_bytes,
+            self.total_wire_payload_bytes,
+            lzma_savings,
+            self.sc_ldpc_bit_flips,
+            self.sc_ldpc_frames_corrected,
+            self.total_symbols_received,
+            self.total_symbols_needed,
+            self.total_valid_frames,
+            self.nbad
+        ));
     }
 }
 
@@ -856,9 +913,8 @@ fn print_usage(prog: &str) {
 fn send_batch(
     paths: Vec<PathBuf>,
     dev_file: &mut File,
+    baud: u64,
     chunk_size: usize,
-    level: i32,
-    mod_mode: ModMode,
     pct: usize,
     rounds: usize,
 ) -> Result<(), String> {
@@ -866,16 +922,16 @@ fn send_batch(
     let (tx_tx, tx_rx) = sync_channel::<Vec<u8>>(128);
 
     let h1 = thread::spawn(move || {
-        crawl_and_compress(paths, chunk_size, level, comp_tx);
+        crawl_and_compress(paths, chunk_size, comp_tx);
     });
 
     let h2 = thread::spawn(move || {
-        encode_stage(comp_rx, tx_tx, mod_mode, pct, rounds);
+        encode_stage(comp_rx, tx_tx, pct, rounds);
     });
 
     let file_clone = dev_file.try_clone().map_err(|e| format!("Failed to clone file descriptor: {}", e))?;
     let h3 = thread::spawn(move || {
-        tx_worker(tx_rx, file_clone);
+        tx_worker(tx_rx, file_clone, baud);
     });
 
     h1.join().map_err(|_| "Reader thread panicked")?;
@@ -949,8 +1005,6 @@ fn do_send(args: &[String]) -> Result<(), String> {
     let mut rounds = 1usize;
     let mut chunk = 0usize;
     let mut pct = 35usize;
-    let mut mod_mode = ModMode::Cobs;
-    let mut level = 6i32;
     let mut watch_dir: Option<PathBuf> = None;
     let mut paths = Vec::new();
 
@@ -962,8 +1016,6 @@ fn do_send(args: &[String]) -> Result<(), String> {
             "-r" => { i += 1; rounds = args.get(i).ok_or("-r requires rounds")?.parse().map_err(|_| "invalid rounds")?; }
             "-c" => { i += 1; chunk = args.get(i).ok_or("-c requires chunk size")?.parse().map_err(|_| "invalid chunk size")?; }
             "-f" => { i += 1; pct = args.get(i).ok_or("-f requires pct")?.parse().map_err(|_| "invalid pct")?; }
-            "-m" => { i += 1; mod_mode = ModMode::from_str(args.get(i).ok_or("-m requires mode")?).ok_or("invalid mode")?; }
-            "-z" => { i += 1; level = args.get(i).ok_or("-z requires level")?.parse().map_err(|_| "invalid level")?; }
             "-w" | "--watch" => {
                 i += 1;
                 let dir_str = args.get(i).ok_or("-w requires directory")?;
@@ -974,11 +1026,9 @@ fn do_send(args: &[String]) -> Result<(), String> {
                            -d DEV    serial device or file (default /dev/ttyUSB0)\n\
                            -b BAUD   baud rate (default 115200)\n\
                            -w DIR    watch directory: auto-create, transmit present files, and delete them\n\
-                           -m MODE   cobs, scramble, raw (default cobs)\n\
                            -c BYTES  symbol chunk size (default: auto)\n\
                            -f PCT    RaptorQ repair percentage (default 35)\n\
-                           -r ROUNDS repeat rounds (default 1)\n\
-                           -z LEVEL  fast-lzma2 level 0-9 (default 6)");
+                           -r ROUNDS repeat rounds (default 1)");
                 return Ok(());
             }
             arg if !arg.starts_with('-') => {
@@ -993,6 +1043,10 @@ fn do_send(args: &[String]) -> Result<(), String> {
         return Err("No paths specified to send (use -w DIR for watch directory mode)".to_string());
     }
 
+    if baud >= 2_500_000 && pct == 35 {
+        pct = 100;
+    }
+
     let chunk_size = if chunk != 0 { chunk } else { auto_chunk_size(baud) };
     let mut file = open_line_send(Path::new(&dev), baud).map_err(|e| format!("Failed to open {}: {}", dev, e))?;
 
@@ -1002,8 +1056,8 @@ fn do_send(args: &[String]) -> Result<(), String> {
             logmsg(&format!("WATCH created directory: {}", wdir.display()));
         }
         logmsg(&format!(
-            "WATCH monitoring {} (device {}, {} baud, chunk {} B, mod {}) (Ctrl-C to stop)",
-            wdir.display(), dev, baud, chunk_size, mod_mode.as_str()
+            "WATCH monitoring {} (device {}, {} baud, chunk {} B) (Ctrl-C to stop)",
+            wdir.display(), dev, baud, chunk_size
         ));
 
         while !STOP_FLAG.load(Ordering::Relaxed) {
@@ -1031,7 +1085,7 @@ fn do_send(args: &[String]) -> Result<(), String> {
                 }
 
                 logmsg(&format!("WATCH processing: {}", entry.display()));
-                if let Err(e) = send_batch(vec![entry.clone()], &mut file, chunk_size, level, mod_mode, pct, rounds) {
+                if let Err(e) = send_batch(vec![entry.clone()], &mut file, baud, chunk_size, pct, rounds) {
                     logmsg(&format!("ERROR sending {}: {}", entry.display(), e));
                     continue;
                 }
@@ -1053,11 +1107,11 @@ fn do_send(args: &[String]) -> Result<(), String> {
     }
 
     logmsg(&format!(
-        "STREAM starting continuous 3-stage pipeline (device {}, {} baud, chunk {} B, mod {})",
-        dev, baud, chunk_size, mod_mode.as_str()
+        "STREAM starting continuous 3-stage pipeline (device {}, {} baud, chunk {} B)",
+        dev, baud, chunk_size
     ));
 
-    send_batch(paths, &mut file, chunk_size, level, mod_mode, pct, rounds)?;
+    send_batch(paths, &mut file, baud, chunk_size, pct, rounds)?;
     logmsg("FINISHED");
     Ok(())
 }
@@ -1068,7 +1122,6 @@ fn do_recv(args: &[String]) -> Result<(), String> {
     let mut dev = "/dev/ttyUSB0".to_string();
     let mut baud = 115200u64;
     let mut out_dir = PathBuf::from("./recv");
-    let mut mod_mode = ModMode::Cobs;
     let mut idle_sec = 0u64;
     let mut restore_owner = false;
 
@@ -1078,7 +1131,6 @@ fn do_recv(args: &[String]) -> Result<(), String> {
             "-d" => { i += 1; dev = args.get(i).ok_or("-d requires device")?.clone(); }
             "-b" => { i += 1; baud = args.get(i).ok_or("-b requires baud")?.parse().map_err(|_| "invalid baud")?; }
             "-o" => { i += 1; out_dir = PathBuf::from(args.get(i).ok_or("-o requires out dir")?); }
-            "-m" => { i += 1; mod_mode = ModMode::from_str(args.get(i).ok_or("-m requires mode")?).ok_or("invalid mode")?; }
             "-q" => { i += 1; idle_sec = args.get(i).ok_or("-q requires seconds")?.parse().map_err(|_| "invalid seconds")?; }
             "-p" => { restore_owner = true; }
             "-h" | "--help" => {
@@ -1086,7 +1138,6 @@ fn do_recv(args: &[String]) -> Result<(), String> {
                            -d DEV    serial device or file (default /dev/ttyUSB0)\n\
                            -b BAUD   baud rate (default 115200)\n\
                            -o DIR    output directory (default ./recv)\n\
-                           -m MODE   cobs, scramble, raw (default cobs)\n\
                            -q SEC    quit SEC seconds after quiet (default: 0 = loop indefinitely)\n\
                            -p        restore owner/group (requires root)");
                 return Ok(());
@@ -1103,8 +1154,8 @@ fn do_recv(args: &[String]) -> Result<(), String> {
     let mut file = open_line_recv(Path::new(&dev), baud).map_err(|e| format!("Failed to open {}: {}", dev, e))?;
 
     logmsg(&format!(
-        "listening on {} ({} modulation), writing to {} (Ctrl-C to stop)",
-        dev, mod_mode.as_str(), canon_out.display()
+        "listening on {}, writing to {} (Ctrl-C to stop)",
+        dev, canon_out.display()
     ));
 
     let mut in_buf = Vec::with_capacity(1 << 20);
@@ -1152,49 +1203,45 @@ fn do_recv(args: &[String]) -> Result<(), String> {
                 last_activity = Instant::now();
                 in_buf.extend_from_slice(&read_buf[..n]);
 
-                match mod_mode {
-                    ModMode::Cobs => {
-                        let mut p = 0;
-                        while p < in_buf.len() {
-                            if let Some(pos) = in_buf[p..].iter().position(|&b| b == 0x00) {
-                                let frame_end = p + pos;
-                                if frame_end > p {
-                                    if let Some(pay) = mod_frame_decode(&in_buf[p..frame_end], ModMode::Cobs) {
-                                        ctx.process_frame(&pay);
-                                    } else {
-                                        ctx.nbad += 1;
-                                    }
-                                }
-                                p = frame_end + 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        in_buf.drain(..p);
+                let mut p = 0;
+                while p < in_buf.len() {
+                    while p < in_buf.len() && in_buf[p] == 0x00 {
+                        p += 1;
                     }
-                    ModMode::Scramble | ModMode::Raw => {
-                        let mut p = 0;
-                        while p + 6 <= in_buf.len() {
-                            if !in_buf[p..].starts_with(&MAGIC_RAW) {
-                                p += 1;
-                                continue;
-                            }
-                            let raw_len = u16::from_be_bytes([in_buf[p + 4], in_buf[p + 5]]) as usize;
-                            let tot = 6 + raw_len;
-                            if p + tot > in_buf.len() {
+                    if p >= in_buf.len() {
+                        break;
+                    }
+
+                    let mut found = false;
+                    let mut search_start = p;
+                    while let Some(pos) = in_buf[search_start..].iter().position(|&b| b == 0x00) {
+                        let frame_end = search_start + pos;
+                        let candidate = &in_buf[p..frame_end];
+                        if candidate.len() >= 32 {
+                            if let Some(res) = mod_frame_decode(candidate) {
+                                ctx.process_frame(&res.payload, res.bit_corrections);
+                                p = frame_end + 1;
+                                found = true;
                                 break;
                             }
-                            if let Some(pay) = mod_frame_decode(&in_buf[p..p + tot], mod_mode) {
-                                ctx.process_frame(&pay);
-                                p += tot;
-                            } else {
-                                ctx.nbad += 1;
-                                p += 1;
-                            }
                         }
-                        in_buf.drain(..p);
+                        if frame_end + 1 < in_buf.len() && frame_end - p < 1024 {
+                            search_start = frame_end + 1;
+                        } else {
+                            if candidate.len() >= 32 {
+                                ctx.nbad += 1;
+                            }
+                            p = frame_end + 1;
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if !found {
+                        break;
                     }
                 }
+                in_buf.drain(..p);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
                 if STOP_FLAG.load(Ordering::Relaxed) {
