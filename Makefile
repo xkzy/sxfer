@@ -2,8 +2,9 @@
 
 CARGO   ?= cargo
 BIN     := sxfer
-RELEASE_BIN := target/release/$(BIN)
+RELEASE_BIN := target/x86_64-unknown-linux-musl/release/$(BIN)
 MAN1    := $(BIN).1
+
 
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
