@@ -21,13 +21,13 @@ mod win_tray {
     };
     use windows_sys::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-        NIM_MODIFY, NOTIFYICONDATAW,
+        NOTIFYICONDATAW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
         DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage,
         RegisterClassW, SetForegroundWindow, TrackPopupMenu, IDI_APPLICATION, MF_DISABLED,
-        MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
+        MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
         WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_USER, WNDCLASSW,
     };
 
@@ -36,8 +36,6 @@ mod win_tray {
 
     const WM_TRAYICON: u32 = WM_USER + 100;
     const ID_TRAY_STATUS: usize = 2001;
-    const ID_TRAY_TOGGLE: usize = 2002;
-    const ID_TRAY_SEND_FILE: usize = 2003;
     const ID_TRAY_OPEN_DIR: usize = 2004;
     const ID_TRAY_SETTINGS: usize = 2005;
     const ID_TRAY_EXIT: usize = 2006;

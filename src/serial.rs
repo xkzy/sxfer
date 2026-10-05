@@ -11,6 +11,7 @@ pub fn auto_chunk_size(baud: u64) -> usize {
     }
 }
 
+#[cfg(unix)]
 pub fn baud_to_speed(baud: u64) -> Option<u32> {
     match baud {
         1200 => Some(0o000011),
@@ -180,16 +181,15 @@ mod windows_impl {
     use std::ffi::OsStr;
     use std::fs::{File, OpenOptions};
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use std::os::windows::io::{FromRawHandle, RawHandle};
     use std::path::Path;
 
     use windows_sys::Win32::Devices::Communication::{
         PurgeComm, SetCommState, SetCommTimeouts, COMMTIMEOUTS, DCB,
         NOPARITY, ONESTOPBIT, PURGE_RXABORT, PURGE_RXCLEAR, PURGE_TXABORT, PURGE_TXCLEAR,
-        DTR_CONTROL_ENABLE, RTS_CONTROL_ENABLE,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, GENERIC_READ,
+        GetLastError, ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, GENERIC_READ,
         GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
@@ -262,19 +262,8 @@ mod windows_impl {
             dcb.ByteSize = 8;
             dcb.Parity = NOPARITY;
             dcb.StopBits = ONESTOPBIT;
-            dcb.fBinary = 1;
-            dcb.fParity = 0;
-            dcb.fOutxCtsFlow = 0;
-            dcb.fOutxDsrFlow = 0;
-            dcb.fDtrControl = DTR_CONTROL_ENABLE as u32;
-            dcb.fDsrSensitivity = 0;
-            dcb.fTXContinueOnXoff = 1;
-            dcb.fOutX = 0;
-            dcb.fInX = 0;
-            dcb.fErrorChar = 0;
-            dcb.fNull = 0;
-            dcb.fRtsControl = RTS_CONTROL_ENABLE as u32;
-            dcb.fAbortOnError = 0;
+            // fBinary (bit 0) | fDtrControl=ENABLE (bit 4) | fTXContinueOnXoff (bit 7) | fRtsControl=ENABLE (bit 12)
+            dcb._bitfield = 0x0001 | (1 << 4) | (1 << 7) | (1 << 12);
 
             if SetCommState(h, &dcb) == 0 {
                 let err = GetLastError();
@@ -309,7 +298,7 @@ mod windows_impl {
                     std::ptr::null(),
                     OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL,
-                    0,
+                    std::ptr::null_mut(),
                 );
                 if handle == INVALID_HANDLE_VALUE {
                     let err = GetLastError();
@@ -347,7 +336,7 @@ mod windows_impl {
                     std::ptr::null(),
                     OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL,
-                    0,
+                    std::ptr::null_mut(),
                 );
                 if handle == INVALID_HANDLE_VALUE {
                     let err = GetLastError();

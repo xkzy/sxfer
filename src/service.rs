@@ -1,7 +1,10 @@
 //! Linux & Cross-Platform Background Service Daemon with /etc/sxfer.conf and systemd support.
 
-use std::fs;
 use std::path::Path;
+
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
 use std::process::Command;
 
 use crate::config::SxferConfig;
