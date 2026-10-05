@@ -49,6 +49,15 @@ test-watch: $(BIN)
 test-writer: $(BIN)
 	bash test/test_slow_writer.sh
 
+test-daemon: $(BIN)
+	bash test/test_daemon_mode.sh
+
+test-speeds: $(BIN)
+	bash test/test_all_speeds.sh
+
+service-install: $(BIN)
+	sudo ./$(BIN) systemd install
+
 
 install: $(BIN) $(MAN1)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)

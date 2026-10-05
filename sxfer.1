@@ -9,6 +9,14 @@ sxfer \- high-speed, one-way serial file tree transfer using concatenated SC-LDP
 .B sxfer recv
 .RI [ options ]
 .br
+.B sxfer daemon
+.RI [ --config " " CONF ]
+.br
+.B sxfer systemd install
+.br
+.B sxfer tray
+.RI [ --config " " CONF ]
+.br
 .B sxfer crc
 .IR FILE
 .SH DESCRIPTION
@@ -27,16 +35,16 @@ integrates:
 .IP \(bu 2
 \fBOuter Rateless Fountain Coding (RaptorQ over GF(256))\fR: Systematic fountain encoding with multi-block interleaving, recovering from packet drop rates exceeding 80%.
 .IP \(bu 2
-\fBHigh-Ratio LZMA2 Stream Compression\fR: Integrated pure-Rust dictionary compression.
+\fBHigh-Ratio Fast LZMA2 Level 9 Compression\fR: Integrated pure-Rust dictionary compression enforced on all transmitted streams.
 .IP \(bu 2
 \fBWatch Directory Spooling (\-w DIR)\fR: Continuous filesystem monitoring with automatic debouncing, queuing, transmission, and post-transfer cleanup.
 .IP \(bu 2
-\fBBaseband Line Coding & Framing\fR: Consistent Overhead Byte Stuffing (COBS) with 0x00 frame boundaries and Galois LFSR whitening to prevent bit stuffing loss and clock drift.
+\fBUnified Baseband Framing & Line Whitening\fR: Consistent Overhead Byte Stuffing (COBS) with 0x00 frame boundaries and Galois LFSR 16-bit scrambler to prevent bit stuffing loss and clock drift.
 .PP
 .B sxfer send
 walks each
 .IR PATH ,
-compresses files using LZMA2, encodes fountain symbols and SC-LDPC frames, and streams them through the pipeline.
+compresses files using LZMA2 Level 9, encodes fountain symbols and SC-LDPC frames, and streams them through the pipeline.
 Paths are transmitted relative to the working directory.
 .PP
 .B sxfer recv
@@ -53,42 +61,19 @@ Serial device or output file/FIFO (default
 Baud rate from 1200 up to 4000000+ (default
 .BR 115200 ).
 .TP
-.BI \-m " MODE"
-Framing and line coding modulation:
-.B cobs
-(Consistent Overhead Byte Stuffing with 0x00 delimiter, recommended),
-.B scramble
-(Galois LFSR data whitener with magic sync prefix), or
-.B raw
-(standard sync marker with length header). Default is
-.BR cobs .
-.TP
 .BI \-w " DIR"
 Watch directory mode: automatically creates \fIDIR\fR if not existed, continuously monitors it for incoming files or directory trees, transmits them over the serial line with RaptorQ protection, and deletes them upon successful transfer.
 .TP
 .BI \-c " BYTES"
-
 Symbol chunk size in bytes (16 to 65536). If omitted or 0, chunk size is chosen adaptively based on baud rate.
 .TP
 .BI \-f " PCT"
 Extra RaptorQ fountain repair symbols to generate as a percentage of source symbols (default
-.BR 20 ).
+.BR 35 ).
 .TP
 .BI \-r " ROUNDS"
 Number of transmission rounds (default
-.BR 2 ).
-.TP
-.BI \-z " LEVEL"
-LZMA2 compression level:
-.B 0
-for uncompressed,
-.B 1\(en9
-for LZMA2 dictionary levels (default
-.BR 6 ).
-.TP
-.BI \-l " FILE"
-Append timestamped log entries to
-.IR FILE .
+.BR 1 ).
 .TP
 .B \-h
 Display help summary.
@@ -102,15 +87,6 @@ Serial device or input FIFO (default
 Baud rate (default
 .BR 115200 ).
 .TP
-.BI \-m " MODE"
-Demodulation / framing mode:
-.BR cobs ,
-.BR scramble ,
-or
-.B raw
-(default
-.BR cobs ).
-.TP
 .BI \-o " DIR"
 Destination directory for received files (default
 .BR ./recv ).
@@ -118,17 +94,27 @@ Destination directory for received files (default
 .BI \-q " SEC"
 Quit after
 .I SEC
-seconds of line silence.
+seconds of line silence (default: 0 = loop indefinitely).
 .TP
 .B \-p
 Restore original file owner and group (requires root).
 .TP
-.BI \-l " FILE"
-Append timestamped log entries to
-.IR FILE .
-.TP
 .B \-h
 Display help summary.
+.SS daemon
+.TP
+.B sxfer daemon \fR[\fB\-\-config \fICONF\fR]
+Run sxfer as a background service daemon according to
+.IR /etc/sxfer.conf
+(or the configuration file specified by \fICONF\fR).
+.SS systemd
+.TP
+.B sxfer systemd install
+Generate default configuration at \fI/etc/sxfer.conf\fR, install systemd service unit at \fI/etc/systemd/system/sxfer.service\fR, and reload systemd.
+.SS tray
+.TP
+.B sxfer tray \fR[\fB\-\-config \fICONF\fR]
+Run sxfer in Windows System Tray notification area background service mode.
 .SS crc
 .TP
 .B sxfer crc \fIFILE\fR
@@ -147,11 +133,11 @@ Each transmitted frame contains a dedicated 32-bit CRC covering the packet conte
 .B File Integrity
 The end-to-end CRC-32 of every source file is verified upon reassembly and decompression prior to final atomic renaming.
 .SH EXAMPLES
-Send a directory tree over a 2.5 Mbaud RS-485 line with fast-lzma2 level 6 and COBS framing:
+Send a directory tree over a 2.0 Mbaud RS-485 line:
 .PP
 .RS
 .nf
-sxfer send -d /dev/ttyUSB0 -b 2500000 -m cobs -z 6 -r 2 src/ assets/
+sxfer send -d /dev/ttyUSB0 -b 2000000 src/ assets/
 .fi
 .RE
 .PP
@@ -160,7 +146,7 @@ Receive the files into
 .PP
 .RS
 .nf
-sxfer recv -d /dev/ttyUSB0 -b 2500000 -m cobs -o /opt/data -q 10
+sxfer recv -d /dev/ttyUSB0 -b 2000000 -o /opt/data -q 10
 .fi
 .RE
 .PP
@@ -170,7 +156,7 @@ Test transfers over an IPC named pipe:
 .nf
 mkfifo /tmp/wire
 sxfer recv -d /tmp/wire -o /tmp/dst -q 2 &
-sxfer send -d /tmp/wire -m cobs -f 30 file1.bin dir2/
+sxfer send -d /tmp/wire -f 30 file1.bin dir2/
 .fi
 .RE
 .SH SEE ALSO
