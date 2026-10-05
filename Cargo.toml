@@ -8,6 +8,17 @@ description = "High-speed, one-way serial file tree transfer using fast-lzma2, R
 [dependencies]
 lzma-rs = "0.3"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Devices_Communication",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+] }
+
 
 [profile.release]
 opt-level = 3
