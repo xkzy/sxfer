@@ -12,8 +12,6 @@ mod serial;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -37,12 +35,14 @@ fn logmsg(msg: &str) {
     eprintln!("[{:>5}s] {}", now % 86400, msg);
 }
 
+#[cfg(unix)]
 #[repr(C)]
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
 }
 
+#[cfg(unix)]
 #[repr(C)]
 struct PollFd {
     fd: std::os::raw::c_int,
@@ -50,11 +50,16 @@ struct PollFd {
     revents: std::os::raw::c_short,
 }
 
+#[cfg(unix)]
 const POLLIN: std::os::raw::c_short = 0x0001;
+#[cfg(unix)]
 const LOCK_EX: std::os::raw::c_int = 2;
+#[cfg(unix)]
 const LOCK_NB: std::os::raw::c_int = 4;
+#[cfg(unix)]
 const LOCK_UN: std::os::raw::c_int = 8;
 
+#[cfg(unix)]
 extern "C" {
     fn geteuid() -> u32;
     fn chown(path: *const std::os::raw::c_char, owner: u32, group: u32) -> std::os::raw::c_int;
@@ -70,17 +75,172 @@ extern "C" {
     fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
 }
 
+#[cfg(unix)]
 extern "C" fn sig_handler(_: std::os::raw::c_int) {
     STOP_FLAG.store(true, Ordering::SeqCst);
 }
 
 fn install_signal_handlers() {
+    #[cfg(unix)]
     unsafe {
         signal(2, sig_handler);  // SIGINT (Ctrl-C)
         signal(15, sig_handler); // SIGTERM
         signal(1, sig_handler);  // SIGHUP
     }
+
+    #[cfg(windows)]
+    unsafe {
+        unsafe extern "system" fn win_ctrl_handler(_: u32) -> i32 {
+            STOP_FLAG.store(true, Ordering::SeqCst);
+            1
+        }
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(win_ctrl_handler), 1);
+    }
 }
+
+fn get_file_metadata(meta: &fs::Metadata) -> (u32, u32, u32, i64, u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            (meta.mode() & 0o7777) as u32,
+            meta.uid(),
+            meta.gid(),
+            meta.mtime(),
+            meta.mtime_nsec() as u32,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let mode = if meta.permissions().readonly() { 0o444 } else { 0o644 };
+        let (sec, nsec) = match meta.modified() {
+            Ok(st) => match st.duration_since(UNIX_EPOCH) {
+                Ok(dur) => (dur.as_secs() as i64, dur.subsec_nanos()),
+                Err(err) => (-(err.duration().as_secs() as i64), 0),
+            },
+            Err(_) => (0, 0),
+        };
+        (mode, 1000, 1000, sec, nsec)
+    }
+}
+
+fn apply_file_metadata(path: &Path, ftype: char, mode: u32, uid: u32, gid: u32, mt_s: i64, mt_ns: u32) {
+    #[cfg(unix)]
+    {
+        unsafe {
+            if geteuid() == 0 {
+                let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+                if ftype == 'l' {
+                    lchown(c_path.as_ptr(), uid, gid);
+                } else {
+                    chown(c_path.as_ptr(), uid, gid);
+                }
+            }
+        }
+
+        if ftype != 'l' {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777));
+        }
+
+        unsafe {
+            let times = [
+                Timespec { tv_sec: mt_s, tv_nsec: mt_ns as i64 },
+                Timespec { tv_sec: mt_s, tv_nsec: mt_ns as i64 },
+            ];
+            let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+            let flags = if ftype == 'l' { 0x100 } else { 0 }; // AT_SYMLINK_NOFOLLOW = 0x100
+            utimensat(-100, c_path.as_ptr(), times.as_ptr(), flags); // AT_FDCWD = -100
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        let _ = gid;
+        if ftype != 'l' {
+            if let Ok(mut perms) = fs::metadata(path).map(|m| m.permissions()) {
+                if (mode & 0o200) == 0 {
+                    perms.set_readonly(true);
+                } else {
+                    perms.set_readonly(false);
+                }
+                let _ = fs::set_permissions(path, perms);
+            }
+            if mt_s > 0 {
+                if let Ok(f) = OpenOptions::new().write(true).open(path) {
+                    let st = UNIX_EPOCH + Duration::new(mt_s as u64, mt_ns);
+                    let _ = f.set_modified(st);
+                }
+            }
+        }
+    }
+}
+
+fn create_symlink(link_target: &str, dest_path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(link_target, dest_path)
+    }
+    #[cfg(windows)]
+    {
+        let target_path = Path::new(link_target);
+        if target_path.is_dir() {
+            std::os::windows::fs::symlink_dir(target_path, dest_path)
+        } else {
+            std::os::windows::fs::symlink_file(target_path, dest_path)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Symlinks not supported"))
+    }
+}
+
+fn check_file_locked(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(f) = OpenOptions::new().read(true).open(path) {
+            let fd = f.as_raw_fd();
+            let lock_res = unsafe { flock(fd, LOCK_EX | LOCK_NB) };
+            if lock_res != 0 {
+                return true;
+            }
+            unsafe { flock(fd, LOCK_UN); }
+            false
+        } else {
+            true
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{LockFileEx, UnlockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        if let Ok(f) = OpenOptions::new().read(true).open(path) {
+            let handle = f.as_raw_handle() as HANDLE;
+            unsafe {
+                let mut ov: OVERLAPPED = std::mem::zeroed();
+                let res = LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &mut ov);
+                if res == 0 {
+                    return true;
+                }
+                UnlockFileEx(handle, 0, 1, 0, &mut ov);
+            }
+            false
+        } else {
+            true
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
 
 // ----------------------------------------------------------------- SENDER PIPELINE
 #[derive(Clone)]
@@ -160,16 +320,17 @@ fn crawl_and_compress(
             };
 
             let id = generate_id(&clean_rel);
+            let (mode, uid, gid, mtime_sec, mtime_nsec) = get_file_metadata(&meta);
             let mut item = QueueItem {
                 id,
                 ftype: 'f',
                 rel_path: clean_rel,
                 link_target: String::new(),
-                mode: meta.mode() & 0o7777,
-                uid: meta.uid(),
-                gid: meta.gid(),
-                mtime_sec: meta.mtime(),
-                mtime_nsec: meta.mtime_nsec() as u32,
+                mode,
+                uid,
+                gid,
+                mtime_sec,
+                mtime_nsec,
                 size: meta.len(),
                 psize: meta.len(),
                 k: 1,
@@ -465,31 +626,8 @@ impl ReceiverContext {
     }
 
     fn apply_meta(&self, path: &Path, ftype: char, mode: u32, uid: u32, gid: u32, mt_s: i64, mt_ns: u32) {
-        if self.restore_owner && unsafe { geteuid() == 0 } {
-            let _ = unsafe {
-                if ftype == 'l' {
-                    let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-                    lchown(c_path.as_ptr(), uid, gid)
-                } else {
-                    let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-                    chown(c_path.as_ptr(), uid, gid)
-                }
-            };
-        }
-
-        if ftype != 'l' {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777));
-        }
-
-        unsafe {
-            let times = [
-                Timespec { tv_sec: mt_s, tv_nsec: mt_ns as i64 },
-                Timespec { tv_sec: mt_s, tv_nsec: mt_ns as i64 },
-            ];
-            let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-            let flags = if ftype == 'l' { 0x100 } else { 0 }; // AT_SYMLINK_NOFOLLOW = 0x100
-            utimensat(-100, c_path.as_ptr(), times.as_ptr(), flags); // AT_FDCWD = -100
-        }
+        let (u, g) = if self.restore_owner { (uid, gid) } else { (1000, 1000) };
+        apply_file_metadata(path, ftype, mode, u, g, mt_s, mt_ns);
     }
 
     fn finalize_file(&mut self, id: [u8; 8]) {
@@ -615,7 +753,7 @@ impl ReceiverContext {
             logmsg(&format!("DIR   {}", path));
         } else if ftype == 'l' {
             let _ = fs::remove_file(&dest);
-            if symlink(&link, &dest).is_ok() {
+            if create_symlink(&link, &dest).is_ok() {
                 self.apply_meta(&dest, 'l', mode, uid, gid, mtime_sec, mtime_nsec);
                 logmsg(&format!("LINK  {} -> {}", path, link));
             } else {
@@ -963,22 +1101,14 @@ fn is_file_ready_to_send(path: &Path) -> bool {
     }
 
     // Regular file:
-    // 1. Check non-blocking flock to see if writing process holds an exclusive lock
-    if let Ok(f) = OpenOptions::new().read(true).open(path) {
-        let fd = f.as_raw_fd();
-        let lock_res = unsafe { flock(fd, LOCK_EX | LOCK_NB) };
-        if lock_res != 0 {
-            return false;
-        }
-        unsafe { flock(fd, LOCK_UN); }
-    } else {
+    // 1. Check non-blocking lock to see if writing process holds an exclusive lock
+    if check_file_locked(path) {
         return false;
     }
 
     // 2. Measure size and timestamp stability over 250ms debounce
     let size1 = meta1.len();
-    let mt_s1 = meta1.mtime();
-    let mt_ns1 = meta1.mtime_nsec();
+    let mod1 = meta1.modified().ok();
 
     thread::sleep(Duration::from_millis(250));
 
@@ -988,10 +1118,9 @@ fn is_file_ready_to_send(path: &Path) -> bool {
     };
 
     let size2 = meta2.len();
-    let mt_s2 = meta2.mtime();
-    let mt_ns2 = meta2.mtime_nsec();
+    let mod2 = meta2.modified().ok();
 
-    if size1 != size2 || mt_s1 != mt_s2 || mt_ns1 != mt_ns2 {
+    if size1 != size2 || mod1 != mod2 {
         return false;
     }
 
@@ -1163,7 +1292,12 @@ fn do_recv(args: &[String]) -> Result<(), String> {
     let mut last_activity = Instant::now();
     let mut started = false;
 
-    let raw_fd = file.as_raw_fd();
+    #[cfg(unix)]
+    let raw_fd = {
+        use std::os::unix::io::AsRawFd;
+        file.as_raw_fd()
+    };
+    #[cfg(unix)]
     let mut pfd = PollFd {
         fd: raw_fd,
         events: POLLIN,
@@ -1171,24 +1305,27 @@ fn do_recv(args: &[String]) -> Result<(), String> {
     };
 
     while !STOP_FLAG.load(Ordering::Relaxed) {
-        let poll_timeout = if idle_sec > 0 { 200 } else { 500 };
-        let ret = unsafe { poll(&mut pfd, 1, poll_timeout) };
-        if STOP_FLAG.load(Ordering::Relaxed) {
-            break;
-        }
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            logmsg(&format!("poll error: {}", err));
-            break;
-        }
-        if ret == 0 {
-            if idle_sec > 0 && started && last_activity.elapsed().as_secs() >= idle_sec {
+        #[cfg(unix)]
+        {
+            let poll_timeout = if idle_sec > 0 { 200 } else { 500 };
+            let ret = unsafe { poll(&mut pfd, 1, poll_timeout) };
+            if STOP_FLAG.load(Ordering::Relaxed) {
                 break;
             }
-            continue;
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                logmsg(&format!("poll error: {}", err));
+                break;
+            }
+            if ret == 0 {
+                if idle_sec > 0 && started && last_activity.elapsed().as_secs() >= idle_sec {
+                    break;
+                }
+                continue;
+            }
         }
 
         match file.read(&mut read_buf) {
