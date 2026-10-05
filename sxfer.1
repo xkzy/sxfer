@@ -1,0 +1,176 @@
+.TH SXFER 1 "2026-10-05" "sxfer" "User Commands"
+.SH NAME
+sxfer \- high-speed, one-way serial file tree transfer using fast-lzma2, RaptorQ fountain coding, and baseband line coding
+.SH SYNOPSIS
+.B sxfer send
+.RI [ options ]
+.IR PATH ...
+.br
+.B sxfer recv
+.RI [ options ]
+.br
+.B sxfer crc
+.IR FILE
+.SH DESCRIPTION
+.B sxfer
+copies complete directory hierarchies and file trees across a one-way (simplex / TX-only) serial link
+(such as USB-to-UART, RS-485, optical isolators, or unidirectional data diodes).
+There is no reverse channel, no ACKs/NACKs, and no backpressure handshake.
+.PP
+To ensure maximum throughput, zero transmission gaps, and robust erasure recovery,
+.B sxfer
+integrates:
+.IP \(bu 2
+\fBMulti-Threaded fast-lzma2 Compression\fR: Parallel multithreaded dictionary compression.
+.IP \(bu 2
+\fBRateless Fountain Coding (RFC 6330 RaptorQ / Systematic Codes over GF(256))\fR: Files are partitioned into source blocks of up to 128 symbols. Systematic symbols are transmitted with zero overhead, followed by an endless stream of independent repair symbols. Receiving any (1 + \(*e) symbols allows complete reconstruction via full-pivoting Gaussian elimination over GF(256).
+.IP \(bu 2
+\fBBaud-Adaptive Dynamic Chunk Sizing\fR: Chunks scale dynamically with baud rate (1 KiB for <500k baud, 4 KiB for 500k\(en2.5M baud, and 16 KiB for \(>=2.5M baud) to minimize kernel context switch overhead.
+.IP \(bu 2
+\fBContinuous 3-Stage Streaming Pipeline\fR: Disk reader/compressor, RaptorQ fountain encoder, and 64 KiB batched zero-copy serial TX operate concurrently with thread-safe ring buffering, saturating UART TX FIFOs at 100%.
+.IP \(bu 2
+\fBBaseband Line Coding & Framing\fR: Consistent Overhead Byte Stuffing (COBS) with 0x00 frame boundaries and Galois LFSR whitening to prevent bit stuffing loss and clock drift.
+.PP
+.B sxfer send
+walks each
+.IR PATH ,
+compresses files using fast-lzma2, encodes fountain symbols, and streams frames through the pipeline.
+Paths are transmitted relative to the working directory.
+.PP
+.B sxfer recv
+runs on the receiving machine and should be started before the sender.
+It reconstructs files, verifies 32-bit CRC checksums, and applies directory hierarchies, permissions, timestamps, and symlinks.
+.SH OPTIONS
+.SS send
+.TP
+.BI \-d " DEV"
+Serial device or output file/FIFO (default
+.BR /dev/ttyUSB0 ).
+.TP
+.BI \-b " BAUD"
+Baud rate from 1200 up to 4000000+ (default
+.BR 115200 ).
+.TP
+.BI \-m " MODE"
+Framing and line coding modulation:
+.B cobs
+(Consistent Overhead Byte Stuffing with 0x00 delimiter, recommended),
+.B scramble
+(Galois LFSR data whitener with magic sync prefix), or
+.B raw
+(standard sync marker with length header). Default is
+.BR cobs .
+.TP
+.BI \-w " DIR"
+Watch directory mode: automatically creates \fIDIR\fR if not existed, continuously monitors it for incoming files or directory trees, transmits them over the serial line with RaptorQ protection, and deletes them upon successful transfer.
+.TP
+.BI \-c " BYTES"
+
+Symbol chunk size in bytes (16 to 65536). If omitted or 0, chunk size is chosen adaptively based on baud rate.
+.TP
+.BI \-f " PCT"
+Extra RaptorQ fountain repair symbols to generate as a percentage of source symbols (default
+.BR 20 ).
+.TP
+.BI \-r " ROUNDS"
+Number of transmission rounds (default
+.BR 2 ).
+.TP
+.BI \-z " LEVEL"
+fast-lzma2 compression level:
+.B 0
+for uncompressed,
+.B 1\(en9
+for fast-lzma2 dictionary levels (default
+.BR 6 ).
+.TP
+.BI \-l " FILE"
+Append timestamped log entries to
+.IR FILE .
+.TP
+.B \-h
+Display help summary.
+.SS recv
+.TP
+.BI \-d " DEV"
+Serial device or input FIFO (default
+.BR /dev/ttyUSB0 ).
+.TP
+.BI \-b " BAUD"
+Baud rate (default
+.BR 115200 ).
+.TP
+.BI \-m " MODE"
+Demodulation / framing mode:
+.BR cobs ,
+.BR scramble ,
+or
+.B raw
+(default
+.BR cobs ).
+.TP
+.BI \-o " DIR"
+Destination directory for received files (default
+.BR ./recv ).
+.TP
+.BI \-q " SEC"
+Quit after
+.I SEC
+seconds of line silence.
+.TP
+.B \-p
+Restore original file owner and group (requires root).
+.TP
+.BI \-l " FILE"
+Append timestamped log entries to
+.IR FILE .
+.TP
+.B \-h
+Display help summary.
+.SS crc
+.TP
+.B sxfer crc \fIFILE\fR
+Compute and print the standard IEEE 802.3 CRC-32 checksum of
+.IR FILE .
+.SH RECOVERY & VERIFICATION
+.TP
+.B RaptorQ Rateless Fountain Coding
+Files are divided into source blocks with K <= 128 symbols.
+The receiver accumulates incoming symbols and performs Gaussian elimination over GF(256) as soon as K independent symbols are received.
+Packet drops during transmission do not require retransmission; any subsequent repair symbol replaces any lost source symbol.
+.TP
+.B Frame Checking
+Each transmitted frame contains a dedicated 32-bit CRC covering the packet contents. Corrupted frames caused by electrical noise are dropped immediately before reaching the decoder.
+.TP
+.B File Integrity
+The end-to-end CRC-32 of every source file is verified upon reassembly and decompression prior to final atomic renaming.
+.SH EXAMPLES
+Send a directory tree over a 2.5 Mbaud RS-485 line with fast-lzma2 level 6 and COBS framing:
+.PP
+.RS
+.nf
+sxfer send -d /dev/ttyUSB0 -b 2500000 -m cobs -z 6 -r 2 src/ assets/
+.fi
+.RE
+.PP
+Receive the files into
+.IR /opt/data :
+.PP
+.RS
+.nf
+sxfer recv -d /dev/ttyUSB0 -b 2500000 -m cobs -o /opt/data -q 10
+.fi
+.RE
+.PP
+Test transfers over an IPC named pipe:
+.PP
+.RS
+.nf
+mkfifo /tmp/wire
+sxfer recv -d /tmp/wire -o /tmp/dst -q 2 &
+sxfer send -d /tmp/wire -m cobs -f 30 file1.bin dir2/
+.fi
+.RE
+.SH SEE ALSO
+.BR termios (3),
+.BR stty (1)

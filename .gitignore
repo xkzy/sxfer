@@ -1,0 +1,10 @@
+/target
+/sxfer
+/scratch
+*.o
+*.d
+*.a
+*.so
+*.swp
+*~
+.DS_Store

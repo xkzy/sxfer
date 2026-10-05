@@ -1,0 +1,17 @@
+[package]
+name = "sxfer"
+version = "2.0.0"
+edition = "2021"
+authors = ["khing"]
+description = "High-speed, one-way serial file tree transfer using fast-lzma2, RaptorQ fountain coding, and baseband line coding"
+
+[dependencies]
+lzma-rs = "0.3"
+
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
