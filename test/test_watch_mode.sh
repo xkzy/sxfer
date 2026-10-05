@@ -17,12 +17,12 @@ cleanup() {
 trap cleanup EXIT
 
 echo "1. Starting receiver on $PIPE..."
-./sxfer recv -d "$PIPE" -o "$RECV_DIR" -m cobs -q 0 &
+./sxfer recv -d "$PIPE" -o "$RECV_DIR" -q 0 &
 RECV_PID=$!
 sleep 0.3
 
 echo "2. Starting sender in watch mode on non-existent directory $WATCH_DIR..."
-./sxfer send -d "$PIPE" -w "$WATCH_DIR" -m cobs -f 35 -z 6 &
+./sxfer send -d "$PIPE" -w "$WATCH_DIR" -f 35 &
 SENDER_PID=$!
 sleep 0.8
 

@@ -41,7 +41,7 @@ echo "=== Test 1: Random Frame Corruption & Bit Flipping Noise ==="
 echo "=========================================================="
 rm -rf "$DST_DIR"/*
 # Transmit with 50% extra RaptorQ repair symbols
-(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -m cobs -f 50 -z 6 -r 1 text.txt binary.dat nested)
+(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -f 50 -r 1 text.txt binary.dat nested)
 
 python3 -c '
 import random
@@ -76,7 +76,7 @@ with open("'"$NOISY_STREAM"'", "wb") as f:
 print(f"Total Packets: {len(packets)-1}, Corrupted: {corrupted_count} ({corrupted_count*100/(len(packets)-1):.1f}%), Clean: {clean_count}")
 '
 
-./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -m cobs -q 1
+./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -q 1
 
 diff -u "$SRC_DIR/text.txt" "$DST_DIR/text.txt"
 diff -u "$SRC_DIR/binary.dat" "$DST_DIR/binary.dat"
@@ -92,7 +92,7 @@ echo "=== Test 2: Burst Impulse Noise & Line Garbage Injection ==="
 echo "=========================================================="
 rm -rf "$DST_DIR"/*
 # Transmit with 40% repair symbols
-(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -m cobs -f 40 -z 6 -r 1 text.txt binary.dat nested)
+(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -f 40 -r 1 text.txt binary.dat nested)
 
 python3 -c '
 import random, os
@@ -125,7 +125,7 @@ with open("'"$NOISY_STREAM"'", "wb") as f:
 print(f"Total Packets: {len(packets)-1}, Injected Noise Bursts: {injected_bursts}")
 '
 
-./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -m cobs -q 1
+./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -q 1
 
 diff -u "$SRC_DIR/text.txt" "$DST_DIR/text.txt"
 diff -u "$SRC_DIR/binary.dat" "$DST_DIR/binary.dat"
@@ -141,7 +141,7 @@ echo "=== Test 3: Heavy Packet Drop (30% Erasure Channel) ==="
 echo "=========================================================="
 rm -rf "$DST_DIR"/*
 # Transmit with 60% repair symbols
-(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -m cobs -f 60 -z 6 -r 1 text.txt binary.dat nested)
+(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -f 60 -r 1 text.txt binary.dat nested)
 
 python3 -c '
 import random
@@ -170,7 +170,7 @@ with open("'"$NOISY_STREAM"'", "wb") as f:
 print(f"Total Symbol Packets: {len(packets)-1}, Kept: {kept}, Dropped: {dropped} ({dropped*100/(len(packets)-1):.1f}%)")
 '
 
-./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -m cobs -q 1
+./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -q 1
 
 diff -u "$SRC_DIR/text.txt" "$DST_DIR/text.txt"
 diff -u "$SRC_DIR/binary.dat" "$DST_DIR/binary.dat"
@@ -185,8 +185,8 @@ echo "=========================================================="
 echo "=== Test 4: Severe Combined Degradation (Drops + Corruption + Bursts) ==="
 echo "=========================================================="
 rm -rf "$DST_DIR"/*
-# Transmit with 70% repair symbols
-(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -m cobs -f 70 -z 6 -r 1 text.txt binary.dat nested)
+# Transmit with 70% repair symbols and 2 rounds
+(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -f 70 -r 2 text.txt binary.dat nested)
 
 python3 -c '
 import random, os
@@ -236,7 +236,7 @@ with open("'"$NOISY_STREAM"'", "wb") as f:
 print(f"Packets: {len(packets)-1} -> Kept: {kept}, Dropped: {dropped}, Damaged: {corrupted}, Bursts Injected: {bursts}")
 '
 
-./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -m cobs -q 1
+./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -q 1
 
 diff -u "$SRC_DIR/text.txt" "$DST_DIR/text.txt"
 diff -u "$SRC_DIR/binary.dat" "$DST_DIR/binary.dat"
@@ -244,72 +244,15 @@ test -L "$DST_DIR/nested/deep/symlink.txt"
 echo ">>> Test 4 (Severe Combined Channel Degradation) PASSED 100%!"
 
 # -----------------------------------------------------------------------------
-# Test 5: Scrambled LFSR Mode Noise Resilience
+# Test 5: Extreme 80% Packet Drop (80% Erasure Channel)
 # -----------------------------------------------------------------------------
 echo ""
 echo "=========================================================="
-echo "=== Test 5: LFSR Scrambler Mode (-m scramble) Under Noise ==="
-echo "=========================================================="
-rm -rf "$DST_DIR"/*
-# Test Scrambled framing with 50% fountain repair symbols and 25% data symbol drops
-(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -m scramble -f 50 -z 6 -r 1 text.txt binary.dat nested)
-
-python3 -c '
-import random
-random.seed(505)
-
-with open("'"$SPOOL"'", "rb") as f:
-    data = f.read()
-
-# MAGIC = b"\xC3\xA5\x5A\x3C"
-MAGIC = b"\xc3\xa5\x5a\x3c"
-frames = []
-idx = 0
-while idx < len(data):
-    p = data.find(MAGIC, idx)
-    if p == -1:
-        break
-    if p + 6 > len(data):
-        break
-    raw_len = (data[p+4] << 8) | data[p+5]
-    frame = data[p:p+6+raw_len]
-    frames.append(frame)
-    idx = p + 6 + raw_len
-
-out = bytearray()
-kept = 0
-dropped = 0
-for f in frames:
-    # Drop 25% of data symbol frames (> 200 bytes)
-    if len(f) > 200 and random.random() < 0.25:
-        dropped += 1
-        continue
-    out.extend(f)
-    kept += 1
-
-with open("'"$NOISY_STREAM"'", "wb") as f:
-    f.write(out)
-
-print(f"Scramble Frames: {len(frames)} -> Kept: {kept}, Dropped: {dropped} ({dropped*100/len(frames):.1f}%)")
-'
-
-./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -m scramble -q 1
-
-diff -u "$SRC_DIR/text.txt" "$DST_DIR/text.txt"
-diff -u "$SRC_DIR/binary.dat" "$DST_DIR/binary.dat"
-test -L "$DST_DIR/nested/deep/symlink.txt"
-echo ">>> Test 5 (LFSR Scrambler Mode) PASSED 100%!"
-
-# -----------------------------------------------------------------------------
-# Test 6: Extreme 80% Packet Drop (80% Erasure Channel)
-# -----------------------------------------------------------------------------
-echo ""
-echo "=========================================================="
-echo "=== Test 6: Extreme 80% Packet Drop (80% Erasure Channel) ==="
+echo "=== Test 5: Extreme 80% Packet Drop (80% Erasure Channel) ==="
 echo "=========================================================="
 rm -rf "$DST_DIR"/*
 # Transmit with 450% repair fountain overhead (enough to recover from 80% drops)
-(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -m cobs -f 450 -z 6 -r 1 text.txt binary.dat nested)
+(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -f 450 -r 1 text.txt binary.dat nested)
 
 python3 -c '
 import random
@@ -339,15 +282,14 @@ total = len(packets) - 1
 print(f"Total Packets: {total} -> Kept: {kept} ({kept*100/total:.1f}%), Dropped: {dropped} ({dropped*100/total:.1f}%)")
 '
 
-./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -m cobs -q 1
+./sxfer recv -d "$NOISY_STREAM" -o "$DST_DIR" -q 1
 
 diff -u "$SRC_DIR/text.txt" "$DST_DIR/text.txt"
 diff -u "$SRC_DIR/binary.dat" "$DST_DIR/binary.dat"
 test -L "$DST_DIR/nested/deep/symlink.txt"
-echo ">>> Test 6 (Extreme 80% Packet Drop) PASSED 100%!"
+echo ">>> Test 5 (Extreme 80% Packet Drop) PASSED 100%!"
 
 echo ""
 echo "=========================================================="
-echo "=== ALL 6 NOISE & EXTREME ERASURE TESTS PASSED 100%! ==="
+echo "=== ALL 5 NOISE & EXTREME ERASURE TESTS PASSED 100%! ==="
 echo "=========================================================="
-

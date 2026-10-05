@@ -14,12 +14,12 @@ cleanup() {
 trap cleanup EXIT
 
 # Start receiver in continuous loop mode (-q 0)
-./sxfer recv -d "$PIPE" -o "$RECV_DIR" -m cobs -q 0 &
+./sxfer recv -d "$PIPE" -o "$RECV_DIR" -q 0 &
 RECV_PID=$!
 sleep 0.3
 
 # Start sender in watch mode
-./sxfer send -d "$PIPE" -w "$WATCH_DIR" -m cobs -f 35 -z 6 &
+./sxfer send -d "$PIPE" -w "$WATCH_DIR" -f 35 &
 SENDER_PID=$!
 sleep 0.8
 

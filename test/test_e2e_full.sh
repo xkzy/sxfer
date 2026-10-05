@@ -24,26 +24,22 @@ CRC_DATA=$(./sxfer crc "$SRC_DIR/data.bin" | awk '{print $1}')
 echo "Expected CRC hello: $CRC_HELLO"
 echo "Expected CRC data:  $CRC_DATA"
 
-MODES=("cobs" "scramble" "raw")
+echo "=========================================================="
+echo "=== Testing Pipeline Transfer with COBS + Scramble + L9 ==="
+echo "=========================================================="
+rm -rf "$DST_DIR"/*
 
-for mode in "${MODES[@]}"; do
-    echo "=========================================================="
-    echo "=== Testing Pipeline Transfer with Mode: $mode ==="
-    echo "=========================================================="
-    rm -rf "$DST_DIR"/*
+./sxfer recv -d "$PIPE" -o "$DST_DIR" -q 2 &
+RECV_PID=$!
+sleep 0.5
 
-    ./sxfer recv -d "$PIPE" -o "$DST_DIR" -m "$mode" -q 2 &
-    RECV_PID=$!
-    sleep 0.5
+(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$PIPE" -r 1 hello.txt data.bin sub)
+wait $RECV_PID
 
-    (cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$PIPE" -m "$mode" -z 6 -r 1 hello.txt data.bin sub)
-    wait $RECV_PID
-
-    diff -u "$SRC_DIR/hello.txt" "$DST_DIR/hello.txt"
-    diff -u "$SRC_DIR/data.bin" "$DST_DIR/data.bin"
-    test -L "$DST_DIR/sub/link.txt"
-    echo "Mode $mode transfer PASSED!"
-done
+diff -u "$SRC_DIR/hello.txt" "$DST_DIR/hello.txt"
+diff -u "$SRC_DIR/data.bin" "$DST_DIR/data.bin"
+test -L "$DST_DIR/sub/link.txt"
+echo "Pipeline transfer PASSED!"
 
 echo "=========================================================="
 echo "=== Testing Rateless Fountain Decoding with 20% Packet Drops ==="
@@ -53,7 +49,7 @@ CORRUPTED=$(mktemp /tmp/sxfer_corrupt_XXXXXX)
 
 rm -rf "$DST_DIR"/*
 # Generate fountain stream with 50% extra repair symbols (-f 50)
-(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -m cobs -f 50 -r 1 hello.txt data.bin)
+(cd "$SRC_DIR" && /home/khing/Desktop/sxfer/sxfer send -d "$SPOOL" -f 50 -r 1 hello.txt data.bin)
 
 # Drop 20% of COBS packets at random
 python3 -c '
@@ -84,7 +80,7 @@ with open("'"$CORRUPTED"'", "wb") as f:
 print(f"Total packets: {len(packets)-1}, Kept: {kept}, Dropped: {dropped} ({dropped*100/(len(packets)-1):.1f}%)")
 '
 
-./sxfer recv -d "$CORRUPTED" -o "$DST_DIR" -m cobs -q 1
+./sxfer recv -d "$CORRUPTED" -o "$DST_DIR" -q 1
 
 diff -u "$SRC_DIR/hello.txt" "$DST_DIR/hello.txt"
 diff -u "$SRC_DIR/data.bin" "$DST_DIR/data.bin"

@@ -107,7 +107,8 @@ impl ScLdpcCodec {
 
     /// Iterative Multi-Pass Belief Propagation and Syndrome Energy Minimization Decoder.
     /// Recovers from up to 5-10% random bit errors per codeword block.
-    pub fn decode_block(&self, codeword: &mut [u8; LDPC_TOTAL_BYTES], max_iters: usize) -> bool {
+    pub fn decode_block(&self, codeword: &mut [u8; LDPC_TOTAL_BYTES], max_iters: usize) -> (bool, usize) {
+        let orig_codeword = *codeword;
         let mut bits = [0u8; LDPC_TOTAL_BITS];
         for (i, bit) in bits.iter_mut().enumerate() {
             let byte_idx = i / 8;
@@ -135,7 +136,7 @@ impl ScLdpcCodec {
 
         let mut failed_checks = check_syndromes(&bits, &mut syndromes);
         if failed_checks == 0 {
-            return true; // Already clean
+            return (true, 0); // Already clean
         }
 
         let mut best_bits = bits;
@@ -205,7 +206,10 @@ impl ScLdpcCodec {
                         codeword[i / 8] |= 1 << (i % 8);
                     }
                 }
-                return true;
+                let bit_diffs = (0..LDPC_TOTAL_BYTES)
+                    .map(|k| (orig_codeword[k] ^ codeword[k]).count_ones() as usize)
+                    .sum();
+                return (true, bit_diffs);
             }
 
             if failed_checks < min_failed {
@@ -221,10 +225,13 @@ impl ScLdpcCodec {
                     codeword[i / 8] |= 1 << (i % 8);
                 }
             }
-            return true;
+            let bit_diffs = (0..LDPC_TOTAL_BYTES)
+                .map(|k| (orig_codeword[k] ^ codeword[k]).count_ones() as usize)
+                .sum();
+            return (true, bit_diffs);
         }
 
-        false
+        (false, 0)
     }
 }
 
@@ -265,45 +272,58 @@ pub fn sc_ldpc_encode(payload: &[u8]) -> Vec<u8> {
 }
 
 /// Decodes an SC-LDPC protected stream, correcting bit-level errors in each block.
-/// Returns Some(recovered_bytes) if all blocks decoded or were corrected, or None on uncorrectable failure.
-pub fn sc_ldpc_decode(data: &[u8]) -> Option<Vec<u8>> {
+/// Returns Some((recovered_bytes, total_bit_flips)) if all blocks decoded or were corrected, or None on uncorrectable failure.
+pub fn sc_ldpc_decode(data: &[u8]) -> Option<(Vec<u8>, usize)> {
     if data.len() < 4 {
         return None;
     }
     let orig_len = u32::from_be_bytes(data[..4].try_into().ok()?) as usize;
     let payload = &data[4..];
 
-    if payload.len() % LDPC_TOTAL_BYTES != 0 {
+    let expected_blocks = (orig_len + LDPC_BLOCK_BYTES - 1) / LDPC_BLOCK_BYTES;
+    if expected_blocks == 0 || expected_blocks > 2048 {
         return None;
+    }
+    let expected_total_bytes = expected_blocks * LDPC_TOTAL_BYTES;
+
+    let mut payload_buf = payload.to_vec();
+    if payload_buf.len() < expected_total_bytes {
+        if expected_total_bytes - payload_buf.len() > 24 {
+            return None;
+        }
+        payload_buf.resize(expected_total_bytes, 0);
+    } else if payload_buf.len() > expected_total_bytes {
+        if payload_buf.len() - expected_total_bytes > 24 {
+            return None;
+        }
+        payload_buf.truncate(expected_total_bytes);
     }
 
-    let num_blocks = payload.len() / LDPC_TOTAL_BYTES;
-    let expected_blocks = (orig_len + LDPC_BLOCK_BYTES - 1) / LDPC_BLOCK_BYTES;
-    if num_blocks != expected_blocks {
-        return None;
-    }
+    let num_blocks = expected_blocks;
 
     let codec = get_ldpc();
     let mut out = Vec::with_capacity(orig_len);
     let mut block = [0u8; LDPC_TOTAL_BYTES];
+    let mut total_bit_flips = 0;
 
     for b in 0..num_blocks {
         let off = b * LDPC_TOTAL_BYTES;
-        block.copy_from_slice(&payload[off..off + LDPC_TOTAL_BYTES]);
+        block.copy_from_slice(&payload_buf[off..off + LDPC_TOTAL_BYTES]);
 
-        // Attempt bit-level error correction up to 30 iterations
-        let converged = codec.decode_block(&mut block, 30);
+        // Attempt bit-level error correction up to 50 iterations
+        let (converged, flips) = codec.decode_block(&mut block, 50);
         if !converged {
             // Parity checks could not be fully reconciled
             return None;
         }
+        total_bit_flips += flips;
 
         let remaining = orig_len - out.len();
         let take = remaining.min(LDPC_BLOCK_BYTES);
         out.extend_from_slice(&block[..take]);
     }
 
-    Some(out)
+    Some((out, total_bit_flips))
 }
 
 #[cfg(test)]
@@ -314,7 +334,7 @@ mod tests {
     fn test_sc_ldpc_clean_roundtrip() {
         let test_data = b"Hello world! Testing SC-LDPC Spatially-Coupled Rate 2/3 FEC encoding and decoding.";
         let encoded = sc_ldpc_encode(test_data);
-        let decoded = sc_ldpc_decode(&encoded).expect("Clean decode should succeed");
+        let (decoded, _) = sc_ldpc_decode(&encoded).expect("Clean decode should succeed");
         assert_eq!(test_data.to_vec(), decoded);
     }
 
@@ -341,7 +361,8 @@ mod tests {
             encoded[b1 + 42] ^= 0x01;
         }
 
-        let decoded = sc_ldpc_decode(&encoded).expect("SC-LDPC should correct heavy bit flips");
+        let (decoded, bit_flips) = sc_ldpc_decode(&encoded).expect("SC-LDPC should correct heavy bit flips");
+        assert!(bit_flips > 0, "Must report corrected bit flips");
         assert_eq!(test_data.to_vec(), decoded, "Payload must match bit-for-bit after correction");
     }
 }
