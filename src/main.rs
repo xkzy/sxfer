@@ -192,7 +192,8 @@ fn create_symlink(link_target: &str, dest_path: &Path) -> std::io::Result<()> {
         let target_path = Path::new(link_target);
         // Refuse UNC / absolute / drive-prefixed targets: probing them would
         // make Windows authenticate to attacker-chosen hosts (NTLM leak).
-        let bad = link_target.starts_with("\\\\")
+        let bad = Path::new(link_target).components().any(|c| matches!(c, std::path::Component::ParentDir))
+            || link_target.starts_with("\\\\")
             || link_target.starts_with("//")
             || link_target.contains(':')
             || target_path.has_root()
@@ -725,7 +726,16 @@ impl ReceiverContext {
         }
 
         let tmp_path = dest.with_extension("sxfer-part");
-        if fs::write(&tmp_path, &final_data).is_err() || fs::rename(&tmp_path, &dest).is_err() {
+        // A planted symlink at the temp name must not redirect the write:
+        // clear it and create exclusively (O_EXCL never follows symlinks).
+        let _ = fs::remove_file(&tmp_path);
+        let wrote = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .and_then(|mut f| f.write_all(&final_data))
+            .is_ok();
+        if !wrote || fs::rename(&tmp_path, &dest).is_err() {
             logmsg(&format!("FAIL  {}: failed to write to disk", path));
             let _ = fs::remove_file(&tmp_path);
             return;
