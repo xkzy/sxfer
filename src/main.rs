@@ -1083,7 +1083,7 @@ mod hex {
 // ----------------------------------------------------------------- CLI & MAIN
 fn print_usage(prog: &str) {
     eprintln!(
-        "sxfer v2.0 - High-Speed Unidirectional Serial File Transfer\n\n\
+        "sxfer v{ver} - High-Speed Unidirectional Serial File Transfer\n\n\
         Usage:\n  \
           {prog} send -d DEV [-b BAUD] [-r ROUNDS] [-w SPOOL_DIR | PATHS...]\n  \
           {prog} recv -d DEV [-b BAUD] [-o OUT_DIR] [-q QUIET_SEC]\n  \
@@ -1097,7 +1097,8 @@ fn print_usage(prog: &str) {
           daemon    Run background daemon based on /etc/sxfer.conf\n  \
           systemd   Install and enable systemd service unit\n  \
           tray      Run Windows System Tray background service\n  \
-          crc       Compute and print standard CRC32 of a file"
+          crc       Compute and print standard CRC32 of a file",
+        ver = env!("CARGO_PKG_VERSION")
     );
 }
 
@@ -1479,6 +1480,9 @@ fn main() {
     }
 
     match args[1].as_str() {
+        "--version" | "-V" => {
+            println!("sxfer {}", env!("CARGO_PKG_VERSION"));
+        }
         "send" => {
             if let Err(e) = do_send(&args[2..]) {
                 eprintln!("sxfer: {}", e);
