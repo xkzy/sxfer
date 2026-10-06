@@ -11,7 +11,9 @@ mod serial;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +22,76 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crc32::{crc32_file, Crc32};
+
+#[cfg(unix)]
+fn get_file_metadata(meta: &fs::Metadata) -> (u32, u32, u32, i64, u32) {
+    (meta.mode(), meta.uid(), meta.gid(), meta.mtime(), meta.mtime_nsec() as u32)
+}
+#[cfg(not(unix))]
+fn get_file_metadata(meta: &fs::Metadata) -> (u32, u32, u32, i64, u32) {
+    let mt = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH).duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    (0o644, 0, 0, mt.as_secs() as i64, mt.subsec_nanos())
+}
+
+#[cfg(unix)]
+fn try_flock(file: &File) -> bool {
+    let fd = file.as_raw_fd();
+    let lock_res = unsafe { flock(fd, LOCK_EX | LOCK_NB) };
+    if lock_res == 0 {
+        unsafe { flock(fd, LOCK_UN); }
+        true
+    } else {
+        false
+    }
+}
+#[cfg(not(unix))]
+fn try_flock(_file: &File) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn make_symlink(link: &str, dest: &Path) -> std::io::Result<()> {
+    symlink(link, dest)
+}
+#[cfg(not(unix))]
+fn make_symlink(link: &str, dest: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(link, dest)
+}
+
+#[cfg(unix)]
+fn apply_permissions(path: &Path, mode: u32) {
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777));
+}
+#[cfg(not(unix))]
+fn apply_permissions(_path: &Path, _mode: u32) {}
+
+#[cfg(unix)]
+fn apply_chown_and_time(path: &Path, ftype: char, uid: u32, gid: u32, mt_s: i64, mt_ns: u32, restore_owner: bool) {
+    if restore_owner && unsafe { geteuid() == 0 } {
+        let _ = unsafe {
+            if ftype == 'l' {
+                let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+                lchown(c_path.as_ptr(), uid, gid)
+            } else {
+                let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+                chown(c_path.as_ptr(), uid, gid)
+            }
+        };
+    }
+    unsafe {
+        let times = [
+            Timespec { tv_sec: mt_s, tv_nsec: mt_ns as i64 },
+            Timespec { tv_sec: mt_s, tv_nsec: mt_ns as i64 },
+        ];
+        let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let flags = if ftype == 'l' { 0x100 } else { 0 }; // AT_SYMLINK_NOFOLLOW = 0x100
+        utimensat(-100, c_path.as_ptr(), times.as_ptr(), flags); // AT_FDCWD = -100
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_chown_and_time(_path: &Path, _ftype: char, _uid: u32, _gid: u32, _mt_s: i64, _mt_ns: u32, _restore_owner: bool) {}
+
 use lzma2::{compress_lzma2, decompress_lzma2};
 use mod_codec::{mod_frame_decode, mod_frame_encode, ModMode, MAGIC_RAW};
 use raptorq::{RaptorQDecoder, RaptorQEncoder};
@@ -36,24 +108,28 @@ fn logmsg(msg: &str) {
     eprintln!("[{:>5}s] {}", now % 86400, msg);
 }
 
+#[cfg(unix)]
 #[repr(C)]
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
 }
-
+#[cfg(unix)]
 #[repr(C)]
 struct PollFd {
     fd: std::os::raw::c_int,
     events: std::os::raw::c_short,
     revents: std::os::raw::c_short,
 }
-
+#[cfg(unix)]
 const POLLIN: std::os::raw::c_short = 0x0001;
+#[cfg(unix)]
 const LOCK_EX: std::os::raw::c_int = 2;
+#[cfg(unix)]
 const LOCK_NB: std::os::raw::c_int = 4;
+#[cfg(unix)]
 const LOCK_UN: std::os::raw::c_int = 8;
-
+#[cfg(unix)]
 extern "C" {
     fn geteuid() -> u32;
     fn chown(path: *const std::os::raw::c_char, owner: u32, group: u32) -> std::os::raw::c_int;
@@ -68,11 +144,13 @@ extern "C" {
     fn poll(fds: *mut PollFd, nfds: usize, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
     fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
 }
-
+#[cfg(unix)]
 extern "C" fn sig_handler(_: std::os::raw::c_int) {
     STOP_FLAG.store(true, Ordering::SeqCst);
 }
 
+
+#[cfg(unix)]
 fn install_signal_handlers() {
     unsafe {
         signal(2, sig_handler);  // SIGINT (Ctrl-C)
@@ -80,6 +158,9 @@ fn install_signal_handlers() {
         signal(1, sig_handler);  // SIGHUP
     }
 }
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
+
 
 // ----------------------------------------------------------------- SENDER PIPELINE
 #[derive(Clone)]
@@ -164,11 +245,11 @@ fn crawl_and_compress(
                 ftype: 'f',
                 rel_path: clean_rel,
                 link_target: String::new(),
-                mode: meta.mode() & 0o7777,
-                uid: meta.uid(),
-                gid: meta.gid(),
-                mtime_sec: meta.mtime(),
-                mtime_nsec: meta.mtime_nsec() as u32,
+                mode: get_file_metadata(&meta).0,
+                uid: get_file_metadata(&meta).1,
+                gid: get_file_metadata(&meta).2,
+                mtime_sec: get_file_metadata(&meta).3,
+                mtime_nsec: get_file_metadata(&meta).4,
                 size: meta.len(),
                 psize: meta.len(),
                 k: 1,
@@ -343,7 +424,7 @@ fn encode_stage(
     }
 }
 
-fn tx_worker(rx: Receiver<Vec<u8>>, mut file: File) {
+fn tx_worker(rx: Receiver<Vec<u8>>, mut file: Box<dyn serialport::SerialPort>) {
     let mut batch = Vec::with_capacity(65536);
     while let Ok(pkt) = rx.recv() {
         if batch.len() + pkt.len() > 65536 {
@@ -363,7 +444,7 @@ fn tx_worker(rx: Receiver<Vec<u8>>, mut file: File) {
     if !batch.is_empty() {
         let _ = file.write_all(&batch);
     }
-    flush_tty(&file);
+    flush_tty(&mut file);
 }
 
 // ----------------------------------------------------------------- RECEIVER
@@ -440,31 +521,7 @@ impl ReceiverContext {
     }
 
     fn apply_meta(&self, path: &Path, ftype: char, mode: u32, uid: u32, gid: u32, mt_s: i64, mt_ns: u32) {
-        if self.restore_owner && unsafe { geteuid() == 0 } {
-            let _ = unsafe {
-                if ftype == 'l' {
-                    let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-                    lchown(c_path.as_ptr(), uid, gid)
-                } else {
-                    let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-                    chown(c_path.as_ptr(), uid, gid)
-                }
-            };
-        }
-
-        if ftype != 'l' {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777));
-        }
-
-        unsafe {
-            let times = [
-                Timespec { tv_sec: mt_s, tv_nsec: mt_ns as i64 },
-                Timespec { tv_sec: mt_s, tv_nsec: mt_ns as i64 },
-            ];
-            let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-            let flags = if ftype == 'l' { 0x100 } else { 0 }; // AT_SYMLINK_NOFOLLOW = 0x100
-            utimensat(-100, c_path.as_ptr(), times.as_ptr(), flags); // AT_FDCWD = -100
-        }
+        apply_chown_and_time(path, ftype, uid, gid, mt_s, mt_ns, self.restore_owner);
     }
 
     fn finalize_file(&mut self, id: [u8; 8]) {
@@ -583,7 +640,7 @@ impl ReceiverContext {
             logmsg(&format!("DIR   {}", path));
         } else if ftype == 'l' {
             let _ = fs::remove_file(&dest);
-            if symlink(&link, &dest).is_ok() {
+            if make_symlink(&link, &dest).is_ok() {
                 self.apply_meta(&dest, 'l', mode, uid, gid, mtime_sec, mtime_nsec);
                 logmsg(&format!("LINK  {} -> {}", path, link));
             } else {
@@ -855,7 +912,7 @@ fn print_usage(prog: &str) {
 
 fn send_batch(
     paths: Vec<PathBuf>,
-    dev_file: &mut File,
+    dev_file: &mut Box<dyn serialport::SerialPort>,
     chunk_size: usize,
     level: i32,
     mod_mode: ModMode,
@@ -909,20 +966,15 @@ fn is_file_ready_to_send(path: &Path) -> bool {
     // Regular file:
     // 1. Check non-blocking flock to see if writing process holds an exclusive lock
     if let Ok(f) = OpenOptions::new().read(true).open(path) {
-        let fd = f.as_raw_fd();
-        let lock_res = unsafe { flock(fd, LOCK_EX | LOCK_NB) };
-        if lock_res != 0 {
-            return false;
-        }
-        unsafe { flock(fd, LOCK_UN); }
+        if !try_flock(&f) { return false; }
     } else {
         return false;
     }
 
     // 2. Measure size and timestamp stability over 250ms debounce
     let size1 = meta1.len();
-    let mt_s1 = meta1.mtime();
-    let mt_ns1 = meta1.mtime_nsec();
+    let mt_s1 = get_file_metadata(&meta1).3;
+    let mt_ns1 = get_file_metadata(&meta1).4;
 
     thread::sleep(Duration::from_millis(250));
 
@@ -932,8 +984,8 @@ fn is_file_ready_to_send(path: &Path) -> bool {
     };
 
     let size2 = meta2.len();
-    let mt_s2 = meta2.mtime();
-    let mt_ns2 = meta2.mtime_nsec();
+    let mt_s2 = get_file_metadata(&meta2).3;
+    let mt_ns2 = get_file_metadata(&meta2).4;
 
     if size1 != size2 || mt_s1 != mt_s2 || mt_ns1 != mt_ns2 {
         return false;
@@ -1112,40 +1164,12 @@ fn do_recv(args: &[String]) -> Result<(), String> {
     let mut last_activity = Instant::now();
     let mut started = false;
 
-    let raw_fd = file.as_raw_fd();
-    let mut pfd = PollFd {
-        fd: raw_fd,
-        events: POLLIN,
-        revents: 0,
-    };
-
     while !STOP_FLAG.load(Ordering::Relaxed) {
-        let poll_timeout = if idle_sec > 0 { 200 } else { 500 };
-        let ret = unsafe { poll(&mut pfd, 1, poll_timeout) };
-        if STOP_FLAG.load(Ordering::Relaxed) {
-            break;
-        }
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            logmsg(&format!("poll error: {}", err));
-            break;
-        }
-        if ret == 0 {
-            if idle_sec > 0 && started && last_activity.elapsed().as_secs() >= idle_sec {
-                break;
-            }
-            continue;
-        }
-
         match file.read(&mut read_buf) {
             Ok(0) => {
                 if idle_sec > 0 && started && last_activity.elapsed().as_secs() >= idle_sec {
                     break;
                 }
-                thread::sleep(Duration::from_millis(50));
             }
             Ok(n) => {
                 started = true;
@@ -1202,11 +1226,10 @@ fn do_recv(args: &[String]) -> Result<(), String> {
                 }
                 continue;
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
                 if idle_sec > 0 && started && last_activity.elapsed().as_secs() >= idle_sec {
                     break;
                 }
-                thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
                 logmsg(&format!("read error: {}", e));
