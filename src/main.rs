@@ -129,20 +129,23 @@ fn get_file_metadata(meta: &fs::Metadata) -> (u32, u32, u32, i64, u32) {
 fn apply_file_metadata(path: &Path, ftype: char, mode: u32, uid: u32, gid: u32, mt_s: i64, mt_ns: u32) {
     #[cfg(unix)]
     {
+        // Never operate through a symlink, whatever the header claims.
+        let is_link = fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+        if (ftype == 'l') != is_link {
+            return;
+        }
+
         unsafe {
             if geteuid() == 0 {
                 let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-                if ftype == 'l' {
-                    lchown(c_path.as_ptr(), uid, gid);
-                } else {
-                    chown(c_path.as_ptr(), uid, gid);
-                }
+                lchown(c_path.as_ptr(), uid, gid);
             }
         }
 
         if ftype != 'l' {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777));
+            // Strip setuid/setgid: received files must never become privileged.
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o1777));
         }
 
         unsafe {
@@ -187,7 +190,18 @@ fn create_symlink(link_target: &str, dest_path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let target_path = Path::new(link_target);
-        if target_path.is_dir() {
+        // Refuse UNC / absolute / drive-prefixed targets: probing them would
+        // make Windows authenticate to attacker-chosen hosts (NTLM leak).
+        let bad = link_target.starts_with("\\\\")
+            || link_target.starts_with("//")
+            || link_target.contains(':')
+            || target_path.has_root()
+            || target_path.is_absolute();
+        if bad {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "absolute or UNC symlink target rejected"));
+        }
+        let resolved = dest_path.parent().unwrap_or_else(|| Path::new(".")).join(target_path);
+        if resolved.is_dir() {
             std::os::windows::fs::symlink_dir(target_path, dest_path)
         } else {
             std::os::windows::fs::symlink_file(target_path, dest_path)
@@ -608,23 +622,38 @@ impl ReceiverContext {
     }
 
     fn prep_dest(&self, rel: &str) -> Option<PathBuf> {
-        let clean = rel.trim_start_matches('/').trim_start_matches("./");
-        if clean.is_empty() || clean.contains("..") {
+        use std::path::Component;
+        // Only plain relative components are accepted: no "..", no root/drive/UNC
+        // prefixes, no backslashes or drive colons (Windows-style escapes).
+        if rel.is_empty() || rel.contains('\0') || (cfg!(windows) && (rel.contains('\\') || rel.contains(':'))) {
+            return None;
+        }
+        let rel_path = Path::new(rel.trim_start_matches('/'));
+        let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+        for c in rel_path.components() {
+            match c {
+                Component::Normal(p) => parts.push(p),
+                Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        if parts.is_empty() {
             return None;
         }
 
-        let full = self.out_dir.join(clean);
-        if let Some(parent) = full.parent() {
-            let _ = fs::create_dir_all(parent);
-            if let Ok(canon_parent) = parent.canonicalize() {
-                if let Ok(canon_root) = self.out_dir.canonicalize() {
-                    if !canon_parent.starts_with(&canon_root) {
-                        return None;
-                    }
-                }
+        // Walk every parent directory without following symlinks.
+        let mut cur = self.out_dir.clone();
+        fs::create_dir_all(&cur).ok()?;
+        for p in &parts[..parts.len() - 1] {
+            cur.push(p);
+            match fs::symlink_metadata(&cur) {
+                Ok(m) if m.file_type().is_symlink() || !m.is_dir() => return None,
+                Ok(_) => {}
+                Err(_) => fs::create_dir(&cur).ok()?,
             }
         }
-        Some(full)
+        cur.push(parts[parts.len() - 1]);
+        Some(cur)
     }
 
     fn apply_meta(&self, path: &Path, ftype: char, mode: u32, uid: u32, gid: u32, mt_s: i64, mt_ns: u32) {
@@ -1525,5 +1554,53 @@ fn main() {
             print_usage(&args[0]);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod security_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("sxfer_sec_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn prep_dest_rejects_traversal_and_symlinks() {
+        let root = tmp("root");
+        let outside = tmp("outside");
+        let rx = ReceiverContext::new(root.clone(), false);
+
+        assert!(rx.prep_dest("../x").is_none());
+        assert!(rx.prep_dest("a/../../x").is_none());
+        assert!(rx.prep_dest("").is_none());
+        assert!(rx.prep_dest("ok/file.txt").is_some());
+
+        // planted symlink to an outside dir must not be traversed or populated
+        std::os::unix::fs::symlink(&outside, root.join("evil")).unwrap();
+        assert!(rx.prep_dest("evil/sub/pwn.txt").is_none());
+        assert!(!outside.join("sub").exists());
+        assert!(rx.prep_dest("evil/pwn.txt").is_none());
+    }
+
+    #[test]
+    fn metadata_never_follows_symlink_or_sets_suid() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp("meta");
+        let outside = tmp("meta_out");
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = root.join("dirlink");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        // header claims a directory, but the path is a symlink -> ignored
+        apply_file_metadata(&link, 'd', 0o777, 0, 0, 1, 0);
+        assert_eq!(fs::metadata(&outside).unwrap().permissions().mode() & 0o7777, 0o700);
+
+        let f = root.join("f");
+        fs::write(&f, b"x").unwrap();
+        apply_file_metadata(&f, 'f', 0o6755, 0, 0, 1, 0);
+        assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o7000, 0);
     }
 }

@@ -78,10 +78,18 @@ pub fn install_systemd_service() -> Result<(), String> {
             println!("Using existing configuration at /etc/sxfer.conf");
         }
 
-        let service_content = r#"[Unit]
+        // Hardened unit: the daemon parses untrusted data off a serial line, so
+        // confine it to the configured directories and drop everything it
+        // doesn't need (chown/owner restore still works via CAP_CHOWN/CAP_FOWNER).
+        let cfg = SxferConfig::load_from_file(conf_path).unwrap_or_else(|_| SxferConfig::load_default());
+        let rw_paths = format!("{} {}", cfg.dest_dir, cfg.watch_dir);
+        if rw_paths.chars().any(|c| c == '\n' || c == '\r') {
+            return Err("Refusing to install unit: newline in configured directory".to_string());
+        }
+        let service_content = format!(r#"[Unit]
 Description=sxfer High-Speed Unidirectional Serial Transfer Service
 After=network.target local-fs.target
-Documentation=man:sxfer(1) https://github.com/khing/sxfer
+Documentation=man:sxfer(1) https://github.com/xkzy/sxfer
 
 [Service]
 Type=simple
@@ -90,10 +98,22 @@ Restart=always
 RestartSec=3
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+ReadWritePaths={rw}
 
 [Install]
 WantedBy=multi-user.target
-"#;
+"#, rw = rw_paths);
 
         let unit_path = Path::new("/etc/systemd/system/sxfer.service");
         fs::write(unit_path, service_content)
