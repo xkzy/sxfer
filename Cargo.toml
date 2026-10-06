@@ -9,6 +9,7 @@ description = "High-speed, one-way serial file tree transfer using fast-lzma2, R
 lzma-rs = "0.3"
 
 [target.'cfg(windows)'.dependencies]
+serialport = { version = "4.0", default-features = false }
 windows-sys = { version = "0.59", features = [
     "Win32_Devices_Communication",
     "Win32_Foundation",

@@ -178,190 +178,63 @@ pub use unix_impl::*;
 // =========================================================================
 #[cfg(windows)]
 mod windows_impl {
-    use std::ffi::OsStr;
     use std::fs::{File, OpenOptions};
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
     use std::path::Path;
-
-    use windows_sys::Win32::Devices::Communication::{
-        PurgeComm, SetCommState, SetCommTimeouts, COMMTIMEOUTS, DCB,
-        NOPARITY, ONESTOPBIT, PURGE_RXABORT, PURGE_RXCLEAR, PURGE_TXABORT, PURGE_TXCLEAR,
-    };
-    use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, GENERIC_READ,
-        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, LockFileEx, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_EXISTING,
-    };
-    use windows_sys::Win32::System::IO::OVERLAPPED;
-
-    pub fn normalize_comm_path(path: &Path) -> Vec<u16> {
-        let s = path.to_string_lossy();
-        let upper = s.to_ascii_uppercase();
-        let final_str = if (upper.starts_with("COM") && upper[3..].chars().all(|c| c.is_ascii_digit()))
-            || upper.starts_with(r"\\.\")
-        {
-            if upper.starts_with(r"\\.\") {
-                s.to_string()
-            } else {
-                format!(r"\\.\{}", s)
-            }
-        } else {
-            s.to_string()
-        };
-
-        OsStr::new(&final_str)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
+    use std::time::Duration;
 
     pub fn is_comm_port(path: &Path) -> bool {
         let s = path.to_string_lossy().to_ascii_uppercase();
         s.starts_with("COM") || s.starts_with(r"\\.\COM")
     }
 
-    pub fn lock_device(handle: RawHandle, path: &Path) -> std::io::Result<()> {
-        if !is_comm_port(path) {
-            return Ok(());
-        }
-        unsafe {
-            let mut overlapped: OVERLAPPED = std::mem::zeroed();
-            let res = LockFileEx(
-                handle as HANDLE,
-                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-                0,
-                1,
-                0,
-                &mut overlapped,
-            );
-            if res == 0 {
-                let err = GetLastError();
-                if err == ERROR_LOCK_VIOLATION || err == ERROR_ACCESS_DENIED {
-                    return Err(std::io::Error::new(
+    /// Open a COM port through the `serialport` crate (8N1, no flow control).
+    /// serialport opens the device with exclusive sharing, so a second
+    /// sxfer instance gets ERROR_ACCESS_DENIED, reported here as ResourceBusy.
+    /// The handle is handed back as a plain `File` so callers stay OS-agnostic.
+    fn open_comm(path: &Path, baud: u64, timeout_ms: u64) -> std::io::Result<File> {
+        let name = path.to_string_lossy().to_string();
+        let port = serialport::new(name, baud as u32)
+            .data_bits(serialport::DataBits::Eight)
+            .parity(serialport::Parity::None)
+            .stop_bits(serialport::StopBits::One)
+            .flow_control(serialport::FlowControl::None)
+            .timeout(Duration::from_millis(timeout_ms))
+            .open_native()
+            .map_err(|e| {
+                let io: std::io::Error = e.into();
+                if io.kind() == std::io::ErrorKind::PermissionDenied {
+                    std::io::Error::new(
                         std::io::ErrorKind::ResourceBusy,
                         format!("Port '{}' is already in use by another active sxfer TX/RX instance (port locked)", path.display()),
-                    ));
+                    )
+                } else {
+                    io
                 }
-                return Err(std::io::Error::from_raw_os_error(err as i32));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn configure_tty(handle: RawHandle, baud: u64) -> std::io::Result<()> {
-        unsafe {
-            let h = handle as HANDLE;
-            let mut dcb: DCB = std::mem::zeroed();
-            dcb.DCBlength = std::mem::size_of::<DCB>() as u32;
-
-            dcb.BaudRate = baud as u32;
-            dcb.ByteSize = 8;
-            dcb.Parity = NOPARITY;
-            dcb.StopBits = ONESTOPBIT;
-            // fBinary (bit 0) | fDtrControl=ENABLE (bit 4) | fTXContinueOnXoff (bit 7) | fRtsControl=ENABLE (bit 12)
-            dcb._bitfield = 0x0001 | (1 << 4) | (1 << 7) | (1 << 12);
-
-            if SetCommState(h, &dcb) == 0 {
-                let err = GetLastError();
-                return Err(std::io::Error::from_raw_os_error(err as i32));
-            }
-
-            let mut timeouts: COMMTIMEOUTS = std::mem::zeroed();
-            timeouts.ReadIntervalTimeout = 20;
-            timeouts.ReadTotalTimeoutConstant = 200;
-            timeouts.ReadTotalTimeoutMultiplier = 0;
-            timeouts.WriteTotalTimeoutConstant = 1000;
-            timeouts.WriteTotalTimeoutMultiplier = 0;
-
-            if SetCommTimeouts(h, &timeouts) == 0 {
-                let err = GetLastError();
-                return Err(std::io::Error::from_raw_os_error(err as i32));
-            }
-
-            PurgeComm(h, PURGE_RXABORT | PURGE_RXCLEAR | PURGE_TXABORT | PURGE_TXCLEAR);
-        }
-        Ok(())
+            })?;
+        let handle = port.into_raw_handle();
+        Ok(unsafe { File::from_raw_handle(handle) })
     }
 
     pub fn open_line_send(path: &Path, baud: u64) -> std::io::Result<File> {
         if is_comm_port(path) {
-            let wide = normalize_comm_path(path);
-            unsafe {
-                let handle = CreateFileW(
-                    wide.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    std::ptr::null_mut(),
-                );
-                if handle == INVALID_HANDLE_VALUE {
-                    let err = GetLastError();
-                    if err == ERROR_ACCESS_DENIED {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::ResourceBusy,
-                            format!("Port '{}' is already in use by another active sxfer TX/RX instance (port locked)", path.display()),
-                        ));
-                    }
-                    return Err(std::io::Error::from_raw_os_error(err as i32));
-                }
-
-                lock_device(handle as RawHandle, path)?;
-                configure_tty(handle as RawHandle, baud)?;
-                Ok(File::from_raw_handle(handle as RawHandle))
-            }
+            open_comm(path, baud, 1000)
         } else {
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)?;
-            Ok(file)
+            OpenOptions::new().write(true).create(true).truncate(false).open(path)
         }
     }
 
     pub fn open_line_recv(path: &Path, baud: u64) -> std::io::Result<File> {
         if is_comm_port(path) {
-            let wide = normalize_comm_path(path);
-            unsafe {
-                let handle = CreateFileW(
-                    wide.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    std::ptr::null_mut(),
-                );
-                if handle == INVALID_HANDLE_VALUE {
-                    let err = GetLastError();
-                    if err == ERROR_ACCESS_DENIED {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::ResourceBusy,
-                            format!("Port '{}' is already in use by another active sxfer TX/RX instance (port locked)", path.display()),
-                        ));
-                    }
-                    return Err(std::io::Error::from_raw_os_error(err as i32));
-                }
-
-                lock_device(handle as RawHandle, path)?;
-                configure_tty(handle as RawHandle, baud)?;
-                Ok(File::from_raw_handle(handle as RawHandle))
-            }
+            open_comm(path, baud, 200)
         } else {
-            let file = OpenOptions::new().read(true).open(path)?;
-            Ok(file)
+            OpenOptions::new().read(true).open(path)
         }
     }
 
     pub fn flush_tty(file: &File) {
         let _ = file.sync_all();
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(60));
     }
 }
 
