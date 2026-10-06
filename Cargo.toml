@@ -1,6 +1,6 @@
 [package]
 name = "sxfer"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 authors = ["khing"]
 description = "High-speed, one-way serial file tree transfer using fast-lzma2, RaptorQ fountain coding, and baseband line coding"
