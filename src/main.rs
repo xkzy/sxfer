@@ -764,6 +764,17 @@ fn encode_stage(
 }
 
 fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut (dyn std::io::Write + Send), baud: u64) -> bool {
+    let mut sent: u64 = 0;
+    let diag = |what: &str, sent: u64, e: &std::io::Error| {
+        eprintln!(
+            "DEBUG: {} failed after {} bytes: {} (kind={:?}, os_error={:?})",
+            what,
+            sent,
+            e,
+            e.kind(),
+            e.raw_os_error()
+        );
+    };
     // After the first device error keep draining the channel (so producers never block)
     // but report failure: the caller must not treat the data as sent.
     let mut ok = true;
@@ -774,10 +785,11 @@ fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut (dyn std::io::Write + Send), baud
             }
             for chunk in pkt.chunks(64) {
                 if let Err(e) = file.write_all(chunk) {
-                    eprintln!("DEBUG: write_all failed: {}", e);
+                    diag("write_all", sent, &e);
                     ok = false;
                     break;
                 }
+                sent += chunk.len() as u64;
                 thread::sleep(Duration::from_micros(150));
             }
             // Inter-frame line recovery time (allows UART to return to idle HIGH)
@@ -790,22 +802,25 @@ fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut (dyn std::io::Write + Send), baud
                 continue;
             }
             if batch.len() + pkt.len() > 4096 {
-                if let Err(e) = file.write_all(&batch) {
-                    eprintln!("DEBUG: write_all (batch) failed: {}", e);
-                    ok = false;
+                match file.write_all(&batch) {
+                    Ok(()) => sent += batch.len() as u64,
+                    Err(e) => {
+                        diag("write_all (batch)", sent, &e);
+                        ok = false;
+                    }
                 }
                 batch.clear();
             }
             if pkt.len() > 4096 {
                 if !batch.is_empty() {
                     if let Err(e) = file.write_all(&batch) {
-                        eprintln!("DEBUG: write_all (batch before big) failed: {}", e);
+                        diag("write_all (batch before big)", sent, &e);
                         ok = false;
                     }
                     batch.clear();
                 }
                 if let Err(e) = file.write_all(&pkt) {
-                    eprintln!("DEBUG: write_all (big pkt) failed: {}", e);
+                    diag("write_all (big pkt)", sent, &e);
                     ok = false;
                 }
             } else {
@@ -814,7 +829,7 @@ fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut (dyn std::io::Write + Send), baud
         }
         if ok && !batch.is_empty() {
             if let Err(e) = file.write_all(&batch) {
-                eprintln!("DEBUG: write_all (final batch) failed: {}", e);
+                diag("write_all (final batch)", sent, &e);
                 ok = false;
             }
         }
