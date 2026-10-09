@@ -763,7 +763,7 @@ fn encode_stage(
     ok
 }
 
-fn tx_worker(rx: Receiver<Vec<u8>>, mut file: File, baud: u64) -> bool {
+fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut File, baud: u64) -> bool {
     // After the first device error keep draining the channel (so producers never block)
     // but report failure: the caller must not treat the data as sent.
     let mut ok = true;
@@ -1949,21 +1949,25 @@ fn send_batch(
     let (tx_tx, tx_rx) = sync_channel::<Vec<u8>>(128);
 
     let sign_key_clone = sign_key;
-    let h1 = thread::spawn(move || {
-        crawl_and_compress(paths, chunk_size, comp_tx, sign_key_clone.as_deref())
+    
+    let mut skipped = 0;
+    let mut enc_ok = false;
+    let mut tx_ok = false;
+
+    std::thread::scope(|s| {
+        let h1 = s.spawn(|| {
+            crawl_and_compress(paths, chunk_size, comp_tx, sign_key_clone.as_deref())
+        });
+
+        let h2 = s.spawn(|| encode_stage(comp_rx, tx_tx, pct, rounds));
+
+        let h3 = s.spawn(|| tx_worker(tx_rx, dev_file, baud));
+
+        skipped = h1.join().unwrap_or(0);
+        enc_ok = h2.join().unwrap_or(false);
+        tx_ok = h3.join().unwrap_or(false);
     });
 
-    let h2 = thread::spawn(move || encode_stage(comp_rx, tx_tx, pct, rounds));
-
-    let file_clone = dev_file
-        .try_clone()
-        .map_err(|e| format!("Failed to clone file descriptor: {}", e))?;
-    let h3 = thread::spawn(move || tx_worker(tx_rx, file_clone, baud));
-
-    let skipped = h1.join().map_err(|_| "Reader thread panicked")?;
-    let enc_ok = h2.join().map_err(|_| "Encoder thread panicked")?;
-    let tx_ok = h3.join().map_err(|_| "TX thread panicked")?;
-    flush_tty(dev_file);
     if skipped > 0 {
         return Err(format!("{} item(s) could not be read or queued", skipped));
     }
