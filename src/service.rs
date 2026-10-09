@@ -36,12 +36,27 @@ pub fn run_daemon(config_path: Option<&Path>) -> Result<(), String> {
             if cfg.keep_damaged {
                 args.push("-k".to_string());
             }
+            if let Some(vk) = cfg.verify_key {
+                args.push("--verify-key".to_string());
+                args.push(vk);
+            }
+            if cfg.require_auth {
+                args.push("--require-auth".to_string());
+            }
+            if let Some(rc) = cfg.replay_cache_file {
+                args.push("--replay-cache".to_string());
+                args.push(rc);
+            }
+            if cfg.max_clock_skew_secs > 0 {
+                args.push("--max-clock-skew".to_string());
+                args.push(cfg.max_clock_skew_secs.to_string());
+            }
             do_recv(&args)
         }
         "sender" | "send" | "tx" | "watch" => {
             let rounds = (cfg.redundancy + 0.5) as usize;
             let rounds = if rounds < 1 { 1 } else { rounds };
-            let args = vec![
+            let mut args = vec![
                 "-d".to_string(),
                 cfg.port,
                 "-b".to_string(),
@@ -51,6 +66,10 @@ pub fn run_daemon(config_path: Option<&Path>) -> Result<(), String> {
                 "-w".to_string(),
                 cfg.watch_dir,
             ];
+            if let Some(sk) = cfg.sign_key {
+                args.push("--sign-key".to_string());
+                args.push(sk);
+            }
             do_send(&args)
         }
         other => Err(format!(
@@ -63,7 +82,9 @@ pub fn run_daemon(config_path: Option<&Path>) -> Result<(), String> {
 pub fn install_systemd_service() -> Result<(), String> {
     #[cfg(not(unix))]
     {
-        return Err("Systemd service installation is only supported on Linux/Unix systems".to_string());
+        return Err(
+            "Systemd service installation is only supported on Linux/Unix systems".to_string(),
+        );
     }
 
     #[cfg(unix)]
@@ -79,14 +100,16 @@ pub fn install_systemd_service() -> Result<(), String> {
         }
 
         // Hardened unit: the daemon parses untrusted data off a serial line, so
-        // confine it to the configured directories and drop everything it
-        // doesn't need (chown/owner restore still works via CAP_CHOWN/CAP_FOWNER).
-        let cfg = SxferConfig::load_from_file(conf_path).unwrap_or_else(|_| SxferConfig::load_default());
-        let rw_paths = format!("{} {}", cfg.dest_dir, cfg.watch_dir);
+        // confine it to the configured directories, drop everything it doesn't need,
+        // and enforce resource boundaries (MemoryMax, TasksMax, LimitNOFILE, LimitCORE).
+        let cfg =
+            SxferConfig::load_from_file(conf_path).unwrap_or_else(|_| SxferConfig::load_default());
+        let rw_paths = format!("\"{}\" \"{}\"", cfg.dest_dir, cfg.watch_dir);
         if rw_paths.chars().any(|c| c == '\n' || c == '\r') {
             return Err("Refusing to install unit: newline in configured directory".to_string());
         }
-        let service_content = format!(r#"[Unit]
+        let service_content = format!(
+            r#"[Unit]
 Description=sxfer High-Speed Unidirectional Serial Transfer Service
 After=network.target local-fs.target
 Documentation=man:sxfer(1) https://github.com/xkzy/sxfer
@@ -108,16 +131,30 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX
 LockPersonality=yes
+MemoryMax=512M
+TasksMax=64
+LimitNOFILE=1024
+LimitCORE=0
+DevicePolicy=closed
+DeviceAllow=/dev/ttyUSB* rw
+DeviceAllow=/dev/ttyS* rw
+DeviceAllow=/dev/ttyACM* rw
 CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
 ReadWritePaths={rw}
 
 [Install]
 WantedBy=multi-user.target
-"#, rw = rw_paths);
+"#,
+            rw = rw_paths
+        );
 
         let unit_path = Path::new("/etc/systemd/system/sxfer.service");
-        fs::write(unit_path, service_content)
-            .map_err(|e| format!("Failed to write /etc/systemd/system/sxfer.service (root required): {}", e))?;
+        fs::write(unit_path, service_content).map_err(|e| {
+            format!(
+                "Failed to write /etc/systemd/system/sxfer.service (root required): {}",
+                e
+            )
+        })?;
         println!("Installed systemd unit at /etc/systemd/system/sxfer.service");
 
         // Try reloading systemd if systemctl is available

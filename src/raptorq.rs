@@ -38,7 +38,11 @@ impl Gf256 {
             }
         }
 
-        Self { exp, log, mul_table }
+        Self {
+            exp,
+            log,
+            mul_table,
+        }
     }
 
     #[inline(always)]
@@ -99,9 +103,9 @@ fn get_symbol_row(esi: u32, k: usize, row_coeffs: &mut [u8]) {
         row_coeffs[0] = 1;
         return;
     }
-    for j in 0..k {
+    for (j, coeff) in row_coeffs.iter_mut().enumerate().take(k) {
         let h = rq_hash(esi, j as u32);
-        row_coeffs[j] = ((h % 255) + 1) as u8;
+        *coeff = ((h % 255) + 1) as u8;
     }
 }
 
@@ -114,7 +118,7 @@ struct BlockEncoder {
 
 impl BlockEncoder {
     fn new(data: &[u8], symbol_size: usize) -> Self {
-        let k = ((data.len() + symbol_size - 1) / symbol_size).max(1);
+        let k = data.len().div_ceil(symbol_size).max(1);
         let mut source_symbols = vec![0u8; k * symbol_size];
         source_symbols[..data.len()].copy_from_slice(data);
 
@@ -131,20 +135,21 @@ impl BlockEncoder {
 
         if (esi as usize) < self.k {
             let off = (esi as usize) * self.symbol_size;
-            out_symbol[..self.symbol_size].copy_from_slice(&self.source_symbols[off..off + self.symbol_size]);
+            out_symbol[..self.symbol_size]
+                .copy_from_slice(&self.source_symbols[off..off + self.symbol_size]);
             return;
         }
 
         let mut row = [0u8; RQ_MAX_K];
         get_symbol_row(esi, self.k, &mut row);
 
-        for i in 0..self.k {
-            if row[i] != 0 {
+        for (i, &coeff) in row.iter().enumerate().take(self.k) {
+            if coeff != 0 {
                 let off = i * self.symbol_size;
                 gf.add_mul(
                     &mut out_symbol[..self.symbol_size],
                     &self.source_symbols[off..off + self.symbol_size],
-                    row[i],
+                    coeff,
                 );
             }
         }
@@ -162,8 +167,8 @@ impl RaptorQEncoder {
             return None;
         }
 
-        let total_k = ((data.len() + symbol_size - 1) / symbol_size).max(1);
-        let num_blocks = (total_k + RQ_MAX_K - 1) / RQ_MAX_K;
+        let total_k = data.len().div_ceil(symbol_size).max(1);
+        let num_blocks = total_k.div_ceil(RQ_MAX_K);
         let block_bytes = RQ_MAX_K * symbol_size;
 
         let mut blocks = Vec::with_capacity(num_blocks);
@@ -173,17 +178,13 @@ impl RaptorQEncoder {
             blocks.push(BlockEncoder::new(&data[off..off + blk_len], symbol_size));
         }
 
-        Some(Self {
-            num_blocks,
-            blocks,
-        })
+        Some(Self { num_blocks, blocks })
     }
 
     #[allow(dead_code)]
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
     }
-
 
     pub fn max_block_k(&self) -> usize {
         self.blocks.iter().map(|b| b.k).max().unwrap_or(1)
@@ -198,13 +199,12 @@ impl RaptorQEncoder {
         } else {
             ((pct * 2) / 100).max(8)
         };
-        let mut syms_per_block = (max_k * (100 + pct) + 99) / 100;
+        let mut syms_per_block = (max_k * (100 + pct)).div_ceil(100);
         if syms_per_block < max_k + min_extra {
             syms_per_block = max_k + min_extra;
         }
         syms_per_block * self.num_blocks
     }
-
 
     pub fn encode_symbol(&self, esi: u32, out_symbol: &mut [u8]) {
         let block_idx = (esi as usize) % self.num_blocks;
@@ -212,7 +212,6 @@ impl RaptorQEncoder {
         self.blocks[block_idx].encode_symbol(block_esi as u32, out_symbol);
     }
 }
-
 
 // ----------------------------------------------------------------- Single Block Decoder
 #[derive(Clone, Copy)]
@@ -235,7 +234,7 @@ struct BlockDecoder {
 
 impl BlockDecoder {
     fn new(data_len: usize, symbol_size: usize) -> Self {
-        let k = ((data_len + symbol_size - 1) / symbol_size).max(1);
+        let k = data_len.div_ceil(symbol_size).max(1);
         Self {
             k,
             symbol_size,
@@ -255,9 +254,13 @@ impl BlockDecoder {
         if self.visited_esis.contains(&esi) {
             return false;
         }
+        if self.esis.len() >= self.k + 64 || self.visited_esis.len() >= RQ_MAX_K + 64 {
+            return false;
+        }
 
         self.esis.push(esi);
-        self.symbols.extend_from_slice(&symbol_data[..self.symbol_size]);
+        self.symbols
+            .extend_from_slice(&symbol_data[..self.symbol_size]);
         self.visited_esis.insert(esi);
 
         if self.esis.len() >= self.k {
@@ -442,8 +445,8 @@ impl RaptorQDecoder {
             return None;
         }
 
-        let total_k = ((data_len + symbol_size - 1) / symbol_size).max(1);
-        let num_blocks = (total_k + RQ_MAX_K - 1) / RQ_MAX_K;
+        let total_k = data_len.div_ceil(symbol_size).max(1);
+        let num_blocks = total_k.div_ceil(RQ_MAX_K);
         let block_bytes = RQ_MAX_K * symbol_size;
 
         let mut blocks = Vec::with_capacity(num_blocks);
@@ -485,20 +488,20 @@ mod tests {
 
     #[test]
     fn test_raptorq_loss_recovery() {
-        let size = 101503;
-        let symbol_size = 1024;
+        let size: usize = 101503;
+        let symbol_size: usize = 1024;
         let data: Vec<u8> = (0..size).map(|i| (i * 37 % 256) as u8).collect();
         let encoder = RaptorQEncoder::new(&data, symbol_size).unwrap();
         let mut decoder = RaptorQDecoder::new(data.len(), symbol_size).unwrap();
 
-        let k = (size + symbol_size - 1) / symbol_size;
+        let k = size.div_ceil(symbol_size);
         let mut sym = vec![0u8; symbol_size];
 
         // Drop 15% of systematic symbols and use repair symbols
         let mut received = 0;
         let mut esi = 0u32;
         while !decoder.is_ready() && esi < 200 {
-            if esi < k as u32 && esi % 7 == 0 {
+            if esi < k as u32 && esi.is_multiple_of(7) {
                 // Drop this symbol
                 esi += 1;
                 continue;
@@ -509,20 +512,25 @@ mod tests {
             esi += 1;
         }
 
-        assert!(decoder.is_ready(), "Decoder failed to recover with {} symbols for k={}", received, k);
+        assert!(
+            decoder.is_ready(),
+            "Decoder failed to recover with {} symbols for k={}",
+            received,
+            k
+        );
         let decoded = decoder.decode_data().expect("Decode failed");
         assert_eq!(data, decoded);
     }
 
     #[test]
     fn test_raptorq_80pct_loss_recovery() {
-        let size = 80000;
-        let symbol_size = 1024;
+        let size: usize = 80000;
+        let symbol_size: usize = 1024;
         let data: Vec<u8> = (0..size).map(|i| (i * 97 % 256) as u8).collect();
         let encoder = RaptorQEncoder::new(&data, symbol_size).unwrap();
         let mut decoder = RaptorQDecoder::new(data.len(), symbol_size).unwrap();
 
-        let k = (size + symbol_size - 1) / symbol_size;
+        let k = size.div_ceil(symbol_size);
         let mut sym = vec![0u8; symbol_size];
 
         // 80% random drop rate
@@ -548,10 +556,30 @@ mod tests {
             esi += 1;
         }
 
-        assert!(decoder.is_ready(), "Decoder failed at 80% loss: received {} for k={}", received, k);
+        assert!(
+            decoder.is_ready(),
+            "Decoder failed at 80% loss: received {} for k={}",
+            received,
+            k
+        );
         let decoded = decoder.decode_data().expect("Decode failed");
         assert_eq!(data, decoded);
     }
+
+    #[test]
+    fn test_decode_with_missing_0_1() {
+        let size: usize = 3000;
+        let symbol_size: usize = 1024;
+        let data: Vec<u8> = (0..size).map(|i| (i * 7 % 251) as u8).collect();
+        let encoder = RaptorQEncoder::new(&data, symbol_size).unwrap();
+        let mut decoder = RaptorQDecoder::new(data.len(), symbol_size).unwrap();
+        let mut sym = vec![0u8; symbol_size];
+        for e in 2..60u32 {
+            encoder.encode_symbol(e, &mut sym);
+            decoder.receive_symbol(e, &sym);
+        }
+        assert!(decoder.is_ready(), "Decoder should be ready!");
+        let decoded = decoder.decode_data().unwrap();
+        assert_eq!(data, decoded);
+    }
 }
-
-

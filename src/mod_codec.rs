@@ -116,15 +116,28 @@ pub fn mod_frame_decode(frame: &[u8]) -> Option<FrameDecodeResult> {
     }
 
     let pay_len = tmp.len() - 8;
-    let expected_payload_crc = u32::from_be_bytes([tmp[pay_len], tmp[pay_len + 1], tmp[pay_len + 2], tmp[pay_len + 3]]);
-    let _expected_ldpc_crc = u32::from_be_bytes([tmp[pay_len + 4], tmp[pay_len + 5], tmp[pay_len + 6], tmp[pay_len + 7]]);
+    let expected_payload_crc = u32::from_be_bytes([
+        tmp[pay_len],
+        tmp[pay_len + 1],
+        tmp[pay_len + 2],
+        tmp[pay_len + 3],
+    ]);
+    let _expected_ldpc_crc = u32::from_be_bytes([
+        tmp[pay_len + 4],
+        tmp[pay_len + 5],
+        tmp[pay_len + 6],
+        tmp[pay_len + 7],
+    ]);
     let _actual_ldpc_crc = Crc32::calculate(&tmp[..pay_len]);
 
     let (mut recovered, bit_corrections) = sc_ldpc_decode(&tmp[..pay_len])?;
     lfsr_scramble(&mut recovered, 0x5A3C);
 
     if Crc32::calculate(&recovered) == expected_payload_crc {
-        return Some(FrameDecodeResult { payload: recovered, bit_corrections });
+        return Some(FrameDecodeResult {
+            payload: recovered,
+            bit_corrections,
+        });
     }
 
     None
@@ -174,7 +187,8 @@ mod tests {
 
     #[test]
     fn test_mod_frame_ldpc_bit_flip_recovery() {
-        let payload = b"Testing SC-LDPC bit-level recovery directly through COBS + Scramble pipeline!";
+        let payload =
+            b"Testing SC-LDPC bit-level recovery directly through COBS + Scramble pipeline!";
         let frame = mod_frame_encode(payload);
 
         // Frame ends with 0x00 delimiter. COBS-decode raw payload to simulate transmission bit flips
@@ -187,7 +201,8 @@ mod tests {
         let mut corrupted_frame = cobs_encode(&scrambled);
         corrupted_frame.push(0x00);
 
-        let res = mod_frame_decode(&corrupted_frame).expect("SC-LDPC must correct bit flips in frame");
+        let res =
+            mod_frame_decode(&corrupted_frame).expect("SC-LDPC must correct bit flips in frame");
         assert_eq!(payload.as_slice(), res.payload.as_slice());
     }
 }

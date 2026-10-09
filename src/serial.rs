@@ -1,6 +1,5 @@
 //! Serial Port & Device I/O Configuration for Linux & Windows.
 
-
 pub fn auto_chunk_size(baud: u64) -> usize {
     if baud < 500_000 {
         1024
@@ -41,11 +40,11 @@ pub fn baud_to_speed(baud: u64) -> Option<u32> {
 // =========================================================================
 #[cfg(unix)]
 mod unix_impl {
+    use super::baud_to_speed;
     use std::fs::{File, OpenOptions};
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::path::Path;
-    use super::baud_to_speed;
 
     #[repr(C)]
     #[derive(Default)]
@@ -64,11 +63,18 @@ mod unix_impl {
         fn isatty(fd: std::os::raw::c_int) -> std::os::raw::c_int;
         fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
         fn tcgetattr(fd: std::os::raw::c_int, termios_p: *mut Termios) -> std::os::raw::c_int;
-        fn tcsetattr(fd: std::os::raw::c_int, optional_actions: std::os::raw::c_int, termios_p: *const Termios) -> std::os::raw::c_int;
+        fn tcsetattr(
+            fd: std::os::raw::c_int,
+            optional_actions: std::os::raw::c_int,
+            termios_p: *const Termios,
+        ) -> std::os::raw::c_int;
         fn cfmakeraw(termios_p: *mut Termios);
         fn cfsetispeed(termios_p: *mut Termios, speed: u32) -> std::os::raw::c_int;
         fn cfsetospeed(termios_p: *mut Termios, speed: u32) -> std::os::raw::c_int;
-        fn tcflush(fd: std::os::raw::c_int, queue_selector: std::os::raw::c_int) -> std::os::raw::c_int;
+        fn tcflush(
+            fd: std::os::raw::c_int,
+            queue_selector: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
     }
 
     const LOCK_EX: std::os::raw::c_int = 2;
@@ -76,17 +82,17 @@ mod unix_impl {
 
     pub fn lock_device(fd: RawFd, path: &Path) -> std::io::Result<()> {
         unsafe {
-            if isatty(fd) != 0 {
-                if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(11) /* EAGAIN / EWOULDBLOCK */ {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::ResourceBusy,
-                            format!("Port '{}' is already in use by another active sxfer TX/RX instance (port locked)", path.display()),
-                        ));
-                    }
-                    return Err(err);
+            if isatty(fd) != 0 && flock(fd, LOCK_EX | LOCK_NB) != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(11)
+                /* EAGAIN / EWOULDBLOCK */
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ResourceBusy,
+                        format!("Port '{}' is already in use by another active sxfer TX/RX instance (port locked)", path.display()),
+                    ));
                 }
+                return Err(err);
             }
         }
         Ok(())
@@ -99,7 +105,10 @@ mod unix_impl {
             }
 
             let speed = baud_to_speed(baud).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Unsupported baud rate: {}", baud))
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Unsupported baud rate: {}", baud),
+                )
             })?;
 
             let mut t = Termios::default();
@@ -220,7 +229,11 @@ mod windows_impl {
         if is_comm_port(path) {
             open_comm(path, baud, 1000)
         } else {
-            OpenOptions::new().write(true).create(true).truncate(false).open(path)
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
         }
     }
 

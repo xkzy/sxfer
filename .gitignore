@@ -8,3 +8,6 @@
 *.swp
 *~
 .DS_Store
+/dist
+*.tar.gz
+

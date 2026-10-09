@@ -18,6 +18,12 @@ pub struct SxferConfig {
     pub poll_interval_ms: u64,
     pub delete_after_send: bool,
     pub notify: bool,
+    // Security & Authentication Layer
+    pub sign_key: Option<String>,
+    pub verify_key: Option<String>,
+    pub require_auth: bool,
+    pub max_clock_skew_secs: i64,
+    pub replay_cache_file: Option<String>,
 }
 
 impl Default for SxferConfig {
@@ -55,6 +61,11 @@ impl Default for SxferConfig {
             poll_interval_ms: 100,
             delete_after_send: true,
             notify: true,
+            sign_key: None,
+            verify_key: None,
+            require_auth: false,
+            max_clock_skew_secs: 300,
+            replay_cache_file: None,
         }
     }
 }
@@ -119,8 +130,9 @@ impl SxferConfig {
                 let key = k.trim().to_lowercase();
                 let mut val = v.trim();
                 // strip optional quotes
-                if (val.starts_with('"') && val.ends_with('"'))
-                    || (val.starts_with('\'') && val.ends_with('\''))
+                if val.len() >= 2
+                    && ((val.starts_with('"') && val.ends_with('"'))
+                        || (val.starts_with('\'') && val.ends_with('\'')))
                 {
                     val = &val[1..val.len() - 1];
                 }
@@ -146,7 +158,9 @@ impl SxferConfig {
             }
             if let Some(v) = sec.get("redundancy") {
                 if let Ok(r) = v.parse::<f64>() {
-                    cfg.redundancy = r;
+                    if r.is_finite() && (0.0..=100.0).contains(&r) {
+                        cfg.redundancy = r;
+                    }
                 }
             }
             if let Some(v) = sec.get("fast_lzma2") {
@@ -198,6 +212,35 @@ impl SxferConfig {
             }
         }
 
+        // Apply security
+        if let Some(sec) = kv_map.get("security") {
+            if let Some(v) = sec.get("sign_key") {
+                if !v.is_empty() {
+                    cfg.sign_key = Some(v.clone());
+                }
+            }
+            if let Some(v) = sec.get("verify_key") {
+                if !v.is_empty() {
+                    cfg.verify_key = Some(v.clone());
+                }
+            }
+            if let Some(v) = sec.get("require_auth") {
+                cfg.require_auth = v.eq_ignore_ascii_case("true") || v == "1";
+            }
+            if let Some(v) = sec.get("max_clock_skew_secs") {
+                if let Ok(s) = v.parse::<i64>() {
+                    if s > 0 {
+                        cfg.max_clock_skew_secs = s;
+                    }
+                }
+            }
+            if let Some(v) = sec.get("replay_cache_file") {
+                if !v.is_empty() {
+                    cfg.replay_cache_file = Some(v.clone());
+                }
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -223,10 +266,28 @@ notify = true
 watch_dir = {watch}
 poll_interval_ms = 100
 delete_after_send = true
+
+[security]
+# require_auth = false
+# verify_key = /etc/sxfer/trusted_sender.pub
+# sign_key = /etc/sxfer/sender_private.key
+# max_clock_skew_secs = 300
 "#,
-            port = if cfg!(windows) { "COM3" } else { "/dev/ttyUSB1" },
-            dest = if cfg!(windows) { r"C:\Downloads\sxfer" } else { "/var/spool/sxfer/incoming" },
-            watch = if cfg!(windows) { r"C:\Downloads\sxfer_outgoing" } else { "/var/spool/sxfer/outgoing" },
+            port = if cfg!(windows) {
+                "COM3"
+            } else {
+                "/dev/ttyUSB1"
+            },
+            dest = if cfg!(windows) {
+                r"C:\Downloads\sxfer"
+            } else {
+                "/var/spool/sxfer/incoming"
+            },
+            watch = if cfg!(windows) {
+                r"C:\Downloads\sxfer_outgoing"
+            } else {
+                "/var/spool/sxfer/outgoing"
+            },
         )
     }
 }

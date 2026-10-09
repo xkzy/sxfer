@@ -7,6 +7,8 @@ description = "High-speed, one-way serial file tree transfer using fast-lzma2, R
 
 [dependencies]
 lzma-rs = "0.3"
+ring = "0.17"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 serialport = { version = "4.0", default-features = false }

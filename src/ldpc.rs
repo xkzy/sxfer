@@ -4,7 +4,7 @@
 //! with Rate 2/3 (256 info bits, 128 parity bits, dv=4, dc=12) and Normalized Min-Sum Belief
 //! Propagation / Multi-Pass Energy Minimization for correcting severe bit error rates (up to 5-10% BER).
 
-pub const LDPC_BLOCK_BITS: usize = 256;  // 32 bytes systematic info block
+pub const LDPC_BLOCK_BITS: usize = 256; // 32 bytes systematic info block
 pub const LDPC_PARITY_BITS: usize = 128; // 16 bytes parity per block (Rate 2/3 code)
 pub const LDPC_TOTAL_BITS: usize = LDPC_BLOCK_BITS + LDPC_PARITY_BITS; // 384 bits (48 bytes)
 
@@ -37,14 +37,17 @@ pub struct ScLdpcCodec {
 
 impl ScLdpcCodec {
     pub fn new() -> Self {
-        let mut check_to_var = vec![Vec::with_capacity(32); NUM_CHECK_EQUATIONS];
-        let mut var_to_check = vec![Vec::with_capacity(8); LDPC_TOTAL_BITS];
+        let mut check_to_var = (0..NUM_CHECK_EQUATIONS)
+            .map(|_| Vec::with_capacity(32))
+            .collect::<Vec<_>>();
+        let mut var_to_check = (0..LDPC_TOTAL_BITS)
+            .map(|_| Vec::with_capacity(8))
+            .collect::<Vec<_>>();
 
         // 1. Construct Spatially-Coupled Parity Check Matrix H = [H_data | H_parity]
         // H_data connects systematic information bits (0..256) to check nodes (0..128)
-        for blk in 0..8 {
+        for (blk, &shifts) in PROTOTYPE_SHIFTS.iter().enumerate() {
             let base_var = blk * 32;
-            let shifts = PROTOTYPE_SHIFTS[blk];
             for i in 0..32 {
                 let v = base_var + i;
                 for &shift in &shifts {
@@ -57,13 +60,17 @@ impl ScLdpcCodec {
         }
 
         // 2. H_parity: Dual-diagonal systematic accumulator structure for fast O(N) encoding
-        for i in 0..NUM_CHECK_EQUATIONS {
+        for (i, check_node) in check_to_var
+            .iter_mut()
+            .enumerate()
+            .take(NUM_CHECK_EQUATIONS)
+        {
             let v = LDPC_BLOCK_BITS + i;
-            check_to_var[i].push(v);
+            check_node.push(v);
             var_to_check[v].push(i);
 
             if i > 0 {
-                check_to_var[i].push(v - 1);
+                check_node.push(v - 1);
                 var_to_check[v - 1].push(i);
             }
         }
@@ -75,12 +82,15 @@ impl ScLdpcCodec {
     }
 
     /// Systematic Encoding: Computes 128 parity bits (16 bytes) for 256 input bits (32 bytes).
-    pub fn encode_block(&self, info: &[u8; LDPC_BLOCK_BYTES], parity: &mut [u8; LDPC_PARITY_BYTES]) {
+    pub fn encode_block(
+        &self,
+        info: &[u8; LDPC_BLOCK_BYTES],
+        parity: &mut [u8; LDPC_PARITY_BYTES],
+    ) {
         let mut syndrome = [0u8; NUM_CHECK_EQUATIONS];
 
         // Accumulate info bit contributions to each check equation
-        for byte_idx in 0..LDPC_BLOCK_BYTES {
-            let byte_val = info[byte_idx];
+        for (byte_idx, &byte_val) in info.iter().enumerate().take(LDPC_BLOCK_BYTES) {
             for bit_pos in 0..8 {
                 if (byte_val & (1 << bit_pos)) != 0 {
                     let var_idx = (byte_idx << 3) | bit_pos;
@@ -107,7 +117,11 @@ impl ScLdpcCodec {
 
     /// Iterative Multi-Pass Belief Propagation and Syndrome Energy Minimization Decoder.
     /// Recovers from up to 5-10% random bit errors per codeword block.
-    pub fn decode_block(&self, codeword: &mut [u8; LDPC_TOTAL_BYTES], max_iters: usize) -> (bool, usize) {
+    pub fn decode_block(
+        &self,
+        codeword: &mut [u8; LDPC_TOTAL_BYTES],
+        max_iters: usize,
+    ) -> (bool, usize) {
         let orig_codeword = *codeword;
         let mut bits = [0u8; LDPC_TOTAL_BITS];
         for (i, bit) in bits.iter_mut().enumerate() {
@@ -119,20 +133,21 @@ impl ScLdpcCodec {
         let mut syndromes = [0u8; NUM_CHECK_EQUATIONS];
 
         // Helper to evaluate all syndromes
-        let check_syndromes = |b: &[u8; LDPC_TOTAL_BITS], s: &mut [u8; NUM_CHECK_EQUATIONS]| -> usize {
-            let mut failed = 0;
-            for c in 0..NUM_CHECK_EQUATIONS {
-                let mut sum = 0u8;
-                for &v in &self.check_to_var[c] {
-                    sum ^= b[v];
+        let check_syndromes =
+            |b: &[u8; LDPC_TOTAL_BITS], s: &mut [u8; NUM_CHECK_EQUATIONS]| -> usize {
+                let mut failed = 0;
+                for (c, check_entry) in s.iter_mut().enumerate().take(NUM_CHECK_EQUATIONS) {
+                    let mut sum = 0u8;
+                    for &v in &self.check_to_var[c] {
+                        sum ^= b[v];
+                    }
+                    *check_entry = sum;
+                    if sum != 0 {
+                        failed += 1;
+                    }
                 }
-                s[c] = sum;
-                if sum != 0 {
-                    failed += 1;
-                }
-            }
-            failed
-        };
+                failed
+            };
 
         let mut failed_checks = check_syndromes(&bits, &mut syndromes);
         if failed_checks == 0 {
@@ -147,8 +162,8 @@ impl ScLdpcCodec {
         for _iter in 0..max_iters {
             flip_weights.fill(0);
 
-            for c in 0..NUM_CHECK_EQUATIONS {
-                if syndromes[c] != 0 {
+            for (c, &syn) in syndromes.iter().enumerate().take(NUM_CHECK_EQUATIONS) {
+                if syn != 0 {
                     for &v in &self.check_to_var[c] {
                         flip_weights[v] += 1;
                     }
@@ -177,9 +192,9 @@ impl ScLdpcCodec {
                 // Pick highest unsatisfied count
                 let mut max_w = 0;
                 let mut best_v = None;
-                for v in 0..LDPC_TOTAL_BITS {
-                    if flip_weights[v] > max_w {
-                        max_w = flip_weights[v];
+                for (v, &w) in flip_weights.iter().enumerate().take(LDPC_TOTAL_BITS) {
+                    if w > max_w {
+                        max_w = w;
                         best_v = Some(v);
                     }
                 }
@@ -246,7 +261,7 @@ fn get_ldpc() -> &'static ScLdpcCodec {
 /// Pads payload to 32-byte blocks, appending 16 bytes of SC-LDPC parity per block (Rate 2/3).
 pub fn sc_ldpc_encode(payload: &[u8]) -> Vec<u8> {
     let codec = get_ldpc();
-    let num_blocks = (payload.len() + LDPC_BLOCK_BYTES - 1) / LDPC_BLOCK_BYTES;
+    let num_blocks = payload.len().div_ceil(LDPC_BLOCK_BYTES);
     let orig_len = payload.len() as u32;
 
     // Output format: [4 bytes orig_len] + [N * 48 bytes SC-LDPC encoded blocks]
@@ -280,7 +295,7 @@ pub fn sc_ldpc_decode(data: &[u8]) -> Option<(Vec<u8>, usize)> {
     let orig_len = u32::from_be_bytes(data[..4].try_into().ok()?) as usize;
     let payload = &data[4..];
 
-    let expected_blocks = (orig_len + LDPC_BLOCK_BYTES - 1) / LDPC_BLOCK_BYTES;
+    let expected_blocks = orig_len.div_ceil(LDPC_BLOCK_BYTES);
     if expected_blocks == 0 || expected_blocks > 2048 {
         return None;
     }
@@ -332,7 +347,8 @@ mod tests {
 
     #[test]
     fn test_sc_ldpc_clean_roundtrip() {
-        let test_data = b"Hello world! Testing SC-LDPC Spatially-Coupled Rate 2/3 FEC encoding and decoding.";
+        let test_data =
+            b"Hello world! Testing SC-LDPC Spatially-Coupled Rate 2/3 FEC encoding and decoding.";
         let encoded = sc_ldpc_encode(test_data);
         let (decoded, _) = sc_ldpc_decode(&encoded).expect("Clean decode should succeed");
         assert_eq!(test_data.to_vec(), decoded);
@@ -361,8 +377,13 @@ mod tests {
             encoded[b1 + 42] ^= 0x01;
         }
 
-        let (decoded, bit_flips) = sc_ldpc_decode(&encoded).expect("SC-LDPC should correct heavy bit flips");
+        let (decoded, bit_flips) =
+            sc_ldpc_decode(&encoded).expect("SC-LDPC should correct heavy bit flips");
         assert!(bit_flips > 0, "Must report corrected bit flips");
-        assert_eq!(test_data.to_vec(), decoded, "Payload must match bit-for-bit after correction");
+        assert_eq!(
+            test_data.to_vec(),
+            decoded,
+            "Payload must match bit-for-bit after correction"
+        );
     }
 }

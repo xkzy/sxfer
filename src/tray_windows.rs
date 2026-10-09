@@ -25,10 +25,10 @@ mod win_tray {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-        DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage,
-        RegisterClassW, SetForegroundWindow, TrackPopupMenu, IDI_APPLICATION, MF_DISABLED,
-        MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
-        WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_USER, WNDCLASSW,
+        DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW,
+        SetForegroundWindow, TrackPopupMenu, IDI_APPLICATION, MF_DISABLED, MF_SEPARATOR, MF_STRING,
+        MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_COMMAND, WM_DESTROY,
+        WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_USER, WNDCLASSW,
     };
 
     use crate::config::SxferConfig;
@@ -41,7 +41,10 @@ mod win_tray {
     const ID_TRAY_EXIT: usize = 2006;
 
     fn to_wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     pub fn run_tray_service_impl(config_path: Option<&Path>) -> Result<(), String> {
@@ -88,7 +91,10 @@ mod win_tray {
             );
 
             if hwnd == 0 as HWND {
-                return Err(format!("Failed to create tray window handle: {}", GetLastError()));
+                return Err(format!(
+                    "Failed to create tray window handle: {}",
+                    GetLastError()
+                ));
             }
 
             let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
@@ -108,7 +114,10 @@ mod win_tray {
             let title_len = title_wide.len().min(63);
             nid.szInfoTitle[..title_len].copy_from_slice(&title_wide[..title_len]);
 
-            let msg_wide = to_wide(&format!("Service started on {}. Incoming files saved to {}", cfg.port, cfg.dest_dir));
+            let msg_wide = to_wide(&format!(
+                "Service started on {}. Incoming files saved to {}",
+                cfg.port, cfg.dest_dir
+            ));
             let msg_len = msg_wide.len().min(255);
             nid.szInfo[..msg_len].copy_from_slice(&msg_wide[..msg_len]);
 
@@ -146,12 +155,32 @@ mod win_tray {
                     let cfg = SxferConfig::load_default();
 
                     let banner = format!("sxfer: {} @ {} baud", cfg.port, cfg.baud);
-                    AppendMenuW(hmenu, MF_STRING | MF_DISABLED, ID_TRAY_STATUS, to_wide(&banner).as_ptr());
+                    AppendMenuW(
+                        hmenu,
+                        MF_STRING | MF_DISABLED,
+                        ID_TRAY_STATUS,
+                        to_wide(&banner).as_ptr(),
+                    );
                     AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
-                    AppendMenuW(hmenu, MF_STRING, ID_TRAY_OPEN_DIR, to_wide("Open Incoming Folder").as_ptr());
-                    AppendMenuW(hmenu, MF_STRING, ID_TRAY_SETTINGS, to_wide("Open Config File...").as_ptr());
+                    AppendMenuW(
+                        hmenu,
+                        MF_STRING,
+                        ID_TRAY_OPEN_DIR,
+                        to_wide("Open Incoming Folder").as_ptr(),
+                    );
+                    AppendMenuW(
+                        hmenu,
+                        MF_STRING,
+                        ID_TRAY_SETTINGS,
+                        to_wide("Open Config File...").as_ptr(),
+                    );
                     AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
-                    AppendMenuW(hmenu, MF_STRING, ID_TRAY_EXIT, to_wide("Exit sxfer").as_ptr());
+                    AppendMenuW(
+                        hmenu,
+                        MF_STRING,
+                        ID_TRAY_EXIT,
+                        to_wide("Exit sxfer").as_ptr(),
+                    );
 
                     TrackPopupMenu(
                         hmenu,
