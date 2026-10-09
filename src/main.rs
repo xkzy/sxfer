@@ -2253,8 +2253,10 @@ pub fn do_send(args: &[String]) -> Result<(), String> {
                     sanitize_log_str(&entry.to_string_lossy())
                 ));
                 let before = tree_snapshot(&entry);
+                // Absolute path => stored name is the entry itself, without the watch dir prefix.
+                let send_path = std::path::absolute(&entry).unwrap_or_else(|_| entry.clone());
                 if let Err(e) = send_batch(
-                    vec![entry.clone()],
+                    vec![send_path],
                     &mut *file,
                     baud,
                     chunk_size,
