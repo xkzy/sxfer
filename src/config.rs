@@ -244,6 +244,7 @@ impl SxferConfig {
         Ok(cfg)
     }
 
+    #[allow(dead_code)]
     pub fn generate_default_conf() -> String {
         format!(
             r#"# sxfer Configuration File

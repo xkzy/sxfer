@@ -196,7 +196,7 @@ mod win_tray {
                 0
             }
             WM_COMMAND => {
-                let id = (wparam & 0xFFFF) as usize;
+                let id = wparam & 0xFFFF;
                 match id {
                     ID_TRAY_OPEN_DIR => {
                         let cfg = SxferConfig::load_default();

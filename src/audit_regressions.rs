@@ -365,6 +365,7 @@ fn f07_forged_symbol_must_not_permanently_poison_a_transfer() {
 
 // ------------------------------------------------------------------ F-08 (needs root)
 #[test]
+#[cfg(unix)]
 #[ignore = "run as root: cargo test f08 -- --ignored"]
 fn f08_root_receiver_must_not_chown_to_uid_1000_without_dash_p() {
     use std::os::unix::fs::MetadataExt;
@@ -459,6 +460,7 @@ fn f14_log_output_must_not_contain_raw_control_bytes_from_the_wire() {
 
 // ------------------------------------------------------------------ F-15
 #[test]
+#[cfg(unix)]
 fn f15_directory_header_must_not_chmod_a_regular_file() {
     use std::os::unix::fs::PermissionsExt;
     let out = tmpdir("dirhdr");
@@ -502,6 +504,7 @@ fn f18_zero_rounds_must_be_rejected() {
 
 // ------------------------------------------------------------------ F-09 additional cases
 #[test]
+#[cfg(unix)]
 fn f09_unreadable_subdir_and_unsupported_types_fail_the_batch() {
     use std::os::unix::fs::PermissionsExt;
     let d = tmpdir("f09_skip");

@@ -5,8 +5,12 @@
 //! quarantine staging, and replay protection.
 
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+use std::io::Read;
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 

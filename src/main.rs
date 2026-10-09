@@ -217,6 +217,7 @@ fn apply_file_metadata(
                 if (mode & 0o200) == 0 {
                     perms.set_readonly(true);
                 } else {
+                    #[allow(clippy::permissions_set_readonly_false)]
                     perms.set_readonly(false);
                 }
                 let _ = fs::set_permissions(path, perms);

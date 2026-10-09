@@ -82,9 +82,7 @@ pub fn run_daemon(config_path: Option<&Path>) -> Result<(), String> {
 pub fn install_systemd_service() -> Result<(), String> {
     #[cfg(not(unix))]
     {
-        return Err(
-            "Systemd service installation is only supported on Linux/Unix systems".to_string(),
-        );
+        Err("Systemd service installation is only supported on Linux/Unix systems".to_string())
     }
 
     #[cfg(unix)]
