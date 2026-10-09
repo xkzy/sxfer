@@ -1963,15 +1963,14 @@ fn send_batch(
     let (tx_tx, tx_rx) = sync_channel::<Vec<u8>>(128);
 
     let sign_key_clone = sign_key;
-    
+
     let mut skipped = 0;
     let mut enc_ok = false;
     let mut tx_ok = false;
 
     std::thread::scope(|s| {
-        let h1 = s.spawn(|| {
-            crawl_and_compress(paths, chunk_size, comp_tx, sign_key_clone.as_deref())
-        });
+        let h1 =
+            s.spawn(|| crawl_and_compress(paths, chunk_size, comp_tx, sign_key_clone.as_deref()));
 
         let h2 = s.spawn(|| encode_stage(comp_rx, tx_tx, pct, rounds));
 
@@ -2431,10 +2430,7 @@ pub fn do_recv(args: &[String]) -> Result<(), String> {
     let mut started = false;
 
     #[cfg(unix)]
-    let raw_fd = {
-        use std::os::unix::io::AsRawFd;
-        file.as_raw_fd()
-    };
+    let raw_fd = file.as_raw_fd();
     #[cfg(unix)]
     let mut pfd = PollFd {
         fd: raw_fd,

@@ -8,6 +8,7 @@
 //! Wire this in with:   #[cfg(test)] mod audit_regressions;   (in main.rs)
 
 use super::*;
+use std::fs::File;
 use std::process::{Command, Stdio};
 
 // ------------------------------------------------------------------ helpers
