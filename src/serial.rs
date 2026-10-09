@@ -192,9 +192,15 @@ mod windows_impl {
     use std::path::Path;
     use std::time::Duration;
 
+    pub fn normalize_comm_name(path: &Path) -> String {
+        let s = path.to_string_lossy().replace('/', "\\");
+        let trimmed = s.trim_start_matches(r"\\.\").trim_end_matches(':');
+        trimmed.to_string()
+    }
+
     pub fn is_comm_port(path: &Path) -> bool {
-        let s = path.to_string_lossy().to_ascii_uppercase();
-        s.starts_with("COM") || s.starts_with(r"\\.\COM")
+        let norm = normalize_comm_name(path).to_ascii_uppercase();
+        norm.starts_with("COM") && norm[3..].chars().all(|c| c.is_ascii_digit())
     }
 
     /// Open a COM port through the `serialport` crate (8N1, no flow control).
@@ -202,7 +208,7 @@ mod windows_impl {
     /// sxfer instance gets ERROR_ACCESS_DENIED, reported here as ResourceBusy.
     /// The handle is handed back as a plain `File` so callers stay OS-agnostic.
     fn open_comm(path: &Path, baud: u64, timeout_ms: u64) -> std::io::Result<File> {
-        let name = path.to_string_lossy().to_string();
+        let name = normalize_comm_name(path);
         let port = serialport::new(name, baud as u32)
             .data_bits(serialport::DataBits::Eight)
             .parity(serialport::Parity::None)
@@ -227,7 +233,9 @@ mod windows_impl {
 
     pub fn open_line_send(path: &Path, baud: u64) -> std::io::Result<File> {
         if is_comm_port(path) {
-            open_comm(path, baud, 1000)
+            // Duration::ZERO (0 ms) configures COMMTIMEOUTS with zero write timeout
+            // so WriteFile blocks until transmission buffers accept data without timing out after 1s
+            open_comm(path, baud, 0)
         } else {
             OpenOptions::new()
                 .write(true)

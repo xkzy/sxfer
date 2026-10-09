@@ -773,7 +773,8 @@ fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut File, baud: u64) -> bool {
                 continue;
             }
             for chunk in pkt.chunks(64) {
-                if file.write_all(chunk).is_err() {
+                if let Err(e) = file.write_all(chunk) {
+                    eprintln!("TX device write error: {}", e);
                     ok = false;
                     break;
                 }
@@ -789,24 +790,36 @@ fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut File, baud: u64) -> bool {
                 continue;
             }
             if batch.len() + pkt.len() > 4096 {
-                ok &= file.write_all(&batch).is_ok();
+                if let Err(e) = file.write_all(&batch) {
+                    eprintln!("TX device write error: {}", e);
+                    ok = false;
+                }
                 batch.clear();
             }
             if pkt.len() > 4096 {
                 if !batch.is_empty() {
-                    ok &= file.write_all(&batch).is_ok();
+                    if let Err(e) = file.write_all(&batch) {
+                        eprintln!("TX device write error: {}", e);
+                        ok = false;
+                    }
                     batch.clear();
                 }
-                ok &= file.write_all(&pkt).is_ok();
+                if let Err(e) = file.write_all(&pkt) {
+                    eprintln!("TX device write error: {}", e);
+                    ok = false;
+                }
             } else {
                 batch.extend_from_slice(&pkt);
             }
         }
         if ok && !batch.is_empty() {
-            ok &= file.write_all(&batch).is_ok();
+            if let Err(e) = file.write_all(&batch) {
+                eprintln!("TX device write error: {}", e);
+                ok = false;
+            }
         }
     }
-    flush_tty(&file);
+    flush_tty(file);
     ok
 }
 
@@ -1949,15 +1962,14 @@ fn send_batch(
     let (tx_tx, tx_rx) = sync_channel::<Vec<u8>>(128);
 
     let sign_key_clone = sign_key;
-    
+
     let mut skipped = 0;
     let mut enc_ok = false;
     let mut tx_ok = false;
 
     std::thread::scope(|s| {
-        let h1 = s.spawn(|| {
-            crawl_and_compress(paths, chunk_size, comp_tx, sign_key_clone.as_deref())
-        });
+        let h1 =
+            s.spawn(|| crawl_and_compress(paths, chunk_size, comp_tx, sign_key_clone.as_deref()));
 
         let h2 = s.spawn(|| encode_stage(comp_rx, tx_tx, pct, rounds));
 
