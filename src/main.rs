@@ -2078,9 +2078,14 @@ fn is_file_ready_to_send(path: &Path) -> bool {
     true
 }
 
+#[cfg(windows)]
+pub const DEFAULT_SERIAL_DEVICE: &str = "COM1";
+#[cfg(not(windows))]
+pub const DEFAULT_SERIAL_DEVICE: &str = "/dev/ttyUSB0";
+
 pub fn do_send(args: &[String]) -> Result<(), String> {
     install_signal_handlers();
-    let mut dev = "/dev/ttyUSB0".to_string();
+    let mut dev = DEFAULT_SERIAL_DEVICE.to_string();
     let mut baud = 115200u64;
     let mut rounds = 1usize;
     let mut chunk = 0usize;
@@ -2290,7 +2295,7 @@ pub fn do_send(args: &[String]) -> Result<(), String> {
 
 pub fn do_recv(args: &[String]) -> Result<(), String> {
     install_signal_handlers();
-    let mut dev = "/dev/ttyUSB0".to_string();
+    let mut dev = DEFAULT_SERIAL_DEVICE.to_string();
     let mut baud = 115200u64;
     let mut out_dir = PathBuf::from("./recv");
     let mut idle_sec = 0u64;
