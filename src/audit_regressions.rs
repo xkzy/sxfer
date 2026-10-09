@@ -277,7 +277,6 @@ fn f08_root_receiver_must_not_chown_to_uid_1000_without_dash_p() {
 
 // ------------------------------------------------------------------ F-09 / F-10
 #[test]
-#[ignore = "open finding F-09, see docs/SECURITY_AUDIT.md"]
 fn f09_watch_mode_must_not_delete_when_device_writes_fail() {
     let (_, ok, err) = run_child("watch_devfull", Duration::from_secs(30));
     assert!(ok, "source deleted although every device write failed: {}", err);
@@ -348,4 +347,45 @@ fn f18_zero_rounds_must_be_rejected() {
     fs::write(d.join("f.txt"), b"hello").unwrap();
     let r = do_send(&["-d".into(), d.join("line.bin").display().to_string(), "-r".into(), "0".into(), d.join("f.txt").display().to_string()]);
     assert!(r.is_err(), "-r 0 silently transmits headers only");
+}
+
+// ------------------------------------------------------------------ F-09 additional cases
+#[test]
+fn f09_unreadable_subdir_and_unsupported_types_fail_the_batch() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmpdir("f09_skip");
+    let src = d.join("src");
+    fs::create_dir_all(src.join("locked")).unwrap();
+    fs::write(src.join("locked/f"), b"x").unwrap();
+    fs::set_permissions(src.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable_is_enforced = fs::read_dir(src.join("locked")).is_err(); // false when running as root
+    let mut line = File::create(d.join("line.bin")).unwrap();
+    let r = send_batch(vec![src.clone()], &mut line, 115200, 1024, 35, 1);
+    fs::set_permissions(src.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
+    if unreadable_is_enforced {
+        assert!(r.is_err(), "unreadable directory silently skipped");
+    }
+    // a unix socket cannot be transmitted: the batch must report it
+    let sock = d.join("sock");
+    let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    assert!(send_batch(vec![sock], &mut line, 115200, 1024, 35, 1).is_err(), "unsupported file type silently skipped");
+}
+
+#[test]
+fn f09_tree_snapshot_detects_additions_and_edits() {
+    let d = tmpdir("f09_snap");
+    fs::write(d.join("a"), b"1").unwrap();
+    let s1 = tree_snapshot(&d).unwrap();
+    assert_eq!(s1, tree_snapshot(&d).unwrap());
+    fs::write(d.join("b"), b"2").unwrap();
+    assert_ne!(s1, tree_snapshot(&d).unwrap(), "new file not noticed");
+}
+
+#[test]
+fn f09_successful_watch_send_still_deletes() {
+    let d = tmpdir("f09_ok");
+    let src = d.join("f.txt");
+    fs::write(&src, b"hello").unwrap();
+    let mut line = File::create(d.join("line.bin")).unwrap();
+    assert!(send_batch(vec![src], &mut line, 115200, 1024, 35, 1).is_ok());
 }

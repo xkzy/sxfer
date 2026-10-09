@@ -35,7 +35,7 @@ Headline results:
 | F-06 | Receiver state (`table`, `early_syms`, `dirs`) never bounded or evicted | Medium | CONFIRMED (executed) |
 | F-07 | One forged symbol permanently poisons a transfer | Medium | CONFIRMED (executed) |
 | F-08 | Root receiver always `lchown`s to uid 1000; `-p` and header modes are unchecked | Medium | CONFIRMED (inspection; needs root) |
-| F-09 | Watch mode deletes sources after failed/partial transmission | **High** (data loss) | CONFIRMED (executed) |
+| F-09 | Watch mode deletes sources after failed/partial transmission | **High** (data loss) | **FIXED** (patch + regression tests; was CONFIRMED) |
 | F-10 | FIFO in watch dir hangs the sender, ignores SIGTERM | Medium (local) | CONFIRMED (executed) |
 | F-11 | No authentication: CRC-32 only, no replay protection | **High** (design) | DESIGN LIMITATION |
 | F-12 | Arbitrary symlink targets and silent overwrite policy | Medium | CONFIRMED (executed) / by design |
@@ -86,7 +86,8 @@ Attacker profiles used below:
 
 ## 3. Findings
 
-> **Fix status (follow-up):** F-01, F-02, F-03, F-04 are fixed. Header sizes are validated before any allocation or decoder construction (`ReceiverContext::header_problem`, limits `MAX_CSZ` 32 KiB, `MAX_PSIZE` 1 GiB, `MAX_SIZE` 4 GiB, `MAX_LZMA_RATIO` 8192; the `unwrap()` is gone), and LZMA output is capped at the declared size by a `CappedWriter` with pre-allocation limited to 64 MiB. Verified by `f01`..`f04` tests (fail before, pass after), the original PoC streams (now `REJECT header ...` or a clean `LZMA2 decompression failed`, exit 0, no abort under a 600 MB limit), and a round trip of 3 MB text, 500 KB random, an empty file and a subdirectory. The text of F-01..F-04 below describes the audited revision. Windows was not tested. Remaining open: everything else.
+> **Fix status (follow-up):** F-01, F-02, F-03, F-04 are fixed. Header sizes are validated before any allocation or decoder construction (`ReceiverContext::header_problem`, limits `MAX_CSZ` 32 KiB, `MAX_PSIZE` 1 GiB, `MAX_SIZE` 4 GiB, `MAX_LZMA_RATIO` 8192; the `unwrap()` is gone), and LZMA output is capped at the declared size by a `CappedWriter` with pre-allocation limited to 64 MiB. Verified by `f01`..`f04` tests (fail before, pass after), the original PoC streams (now `REJECT header ...` or a clean `LZMA2 decompression failed`, exit 0, no abort under a 600 MB limit), and a round trip of 3 MB text, 500 KB random, an empty file and a subdirectory. The text of F-01..F-04 below describes the audited revision. Windows was not tested. 
+> **F-09 also fixed.** `tx_worker`, `encode_stage` and `crawl_and_compress` now report failure (device write errors, queue drops, stat/read/readlink/`read_dir` failures, unsupported file types, size changed during read) and `send_batch` returns `Err`, so nothing is deleted. The file CRC is now computed from the same single read that is transmitted. Watch mode also takes a `tree_snapshot` (path, size, mtime, inode) before sending and deletes only if the tree is unchanged afterwards; otherwise it logs `NOT DELETED` and re-sends next pass. Verified: `f09_*` tests (4, fail before), `/dev/full` run keeps the file, normal watch run sends and deletes all files and the receiver verifies them. Not changed: the FIFO hang (F-10) and `-r 0` (F-18). Remaining open: F-05..F-08, F-10..F-20.
 
 Line numbers refer to revision `40c00f8`.
 

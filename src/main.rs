@@ -315,11 +315,13 @@ fn crawl_and_compress(
     paths: Vec<PathBuf>,
     chunk_size: usize,
     tx: SyncSender<QueueItem>,
-) {
+) -> usize {
     const COMPRESSION_LEVEL: i32 = 9;
+    // Anything that could not be queued faithfully; the caller must not delete sources if non-zero.
+    let mut problems = 0usize;
     for path in paths {
         let root = path.clone();
-        let walker = walkdir(&path);
+        let walker = walkdir(&path, &mut problems);
         for entry in walker {
             let rel = if !entry.is_absolute() {
                 entry.to_string_lossy().to_string()
@@ -339,6 +341,7 @@ fn crawl_and_compress(
                 Ok(m) => m,
                 Err(e) => {
                     logmsg(&format!("skip (stat failed): {} ({})", entry.display(), e));
+                    problems += 1;
                     continue;
                 }
             };
@@ -368,29 +371,43 @@ fn crawl_and_compress(
                 item.ftype = 'l';
                 item.size = 0;
                 item.psize = 0;
-                item.link_target = fs::read_link(&entry)
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
+                item.link_target = match fs::read_link(&entry) {
+                    Ok(t) => t.to_string_lossy().to_string(),
+                    Err(e) => {
+                        logmsg(&format!("skip (readlink failed): {} ({})", entry.display(), e));
+                        problems += 1;
+                        continue;
+                    }
+                };
                 logmsg(&format!("QUEUED {} (symlink -> {})", item.rel_path, item.link_target));
-                let _ = tx.send(item);
+                if tx.send(item).is_err() {
+                    return problems + 1;
+                }
             } else if meta.is_dir() {
                 item.ftype = 'd';
                 item.size = 0;
                 item.psize = 0;
                 logmsg(&format!("QUEUED {} (dir)", item.rel_path));
-                let _ = tx.send(item);
+                if tx.send(item).is_err() {
+                    return problems + 1;
+                }
             } else if meta.is_file() {
                 item.ftype = 'f';
-                item.fcrc = crc32_file(&entry).unwrap_or(0);
-
                 let raw_data = match fs::read(&entry) {
                     Ok(d) => d,
                     Err(e) => {
                         logmsg(&format!("skip (read failed): {} ({})", entry.display(), e));
+                        problems += 1;
                         continue;
                     }
                 };
+                // Size/CRC must describe the bytes actually sent, so derive them from one read.
+                if raw_data.len() as u64 != meta.len() {
+                    logmsg(&format!("skip (changed while reading): {}", entry.display()));
+                    problems += 1;
+                    continue;
+                }
+                item.fcrc = Crc32::calculate(&raw_data);
 
                 let mut payload = raw_data.clone();
                 let mut meth = 0u8;
@@ -421,24 +438,43 @@ fn crawl_and_compress(
                     ));
                 }
 
-                let _ = tx.send(item);
+                if tx.send(item).is_err() {
+                    return problems + 1;
+                }
+            } else {
+                logmsg(&format!("skip (unsupported file type): {}", entry.display()));
+                problems += 1;
             }
         }
     }
+    problems
 }
 
-fn walkdir(dir: &Path) -> Vec<PathBuf> {
+fn walkdir(dir: &Path, problems: &mut usize) -> Vec<PathBuf> {
     let mut result = Vec::new();
     result.push(dir.to_path_buf());
     if dir.is_dir() && !dir.is_symlink() {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() && !p.is_symlink() {
-                    result.extend(walkdir(&p));
-                } else {
-                    result.push(p);
+        match fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => {
+                            *problems += 1;
+                            continue;
+                        }
+                    };
+                    let p = entry.path();
+                    if p.is_dir() && !p.is_symlink() {
+                        result.extend(walkdir(&p, problems));
+                    } else {
+                        result.push(p);
+                    }
                 }
+            }
+            Err(e) => {
+                logmsg(&format!("skip (cannot list): {} ({})", dir.display(), e));
+                *problems += 1;
             }
         }
     }
@@ -450,7 +486,8 @@ fn encode_stage(
     tx: SyncSender<Vec<u8>>,
     pct: usize,
     rounds: usize,
-) {
+) -> bool {
+    let mut ok = true;
     while let Ok(item) = rx.recv() {
         // 1. Build Header Frame
         let mut hdr = Vec::with_capacity(512);
@@ -485,11 +522,14 @@ fn encode_stage(
         };
         for _ in 0..num_hdr_copies {
             let frame = mod_frame_encode(&hdr);
-            let _ = tx.send(frame);
+            ok &= tx.send(frame).is_ok();
         }
 
         // 2. RaptorQ Fountain Symbols
         if item.ftype == 'f' && item.psize > 0 {
+            if item.k as u64 * item.csz as u64 > u32::MAX as u64 {
+                ok = false; // ESI space (u32) cannot address this file
+            }
             if let Some(rq) = RaptorQEncoder::new(&item.payload, item.csz as usize) {
                 let num_symbols = rq.total_symbols_to_send(pct);
                 let mut sym_buf = vec![0u8; item.csz as usize];
@@ -502,7 +542,7 @@ fn encode_stage(
                         let esi = (round * num_symbols + s) as u32;
                         if esi > 0 && (esi as usize % hdr_freq) == 0 {
                             let mid_hdr = mod_frame_encode(&hdr);
-                            let _ = tx.send(mid_hdr);
+                            ok &= tx.send(mid_hdr).is_ok();
                         }
 
                         rq.encode_symbol(esi, &mut sym_buf);
@@ -514,7 +554,7 @@ fn encode_stage(
                         pkt.extend_from_slice(&sym_buf);
 
                         let tx_frame = mod_frame_encode(&pkt);
-                        let _ = tx.send(tx_frame);
+                        ok &= tx.send(tx_frame).is_ok();
                     }
                 }
             }
@@ -522,17 +562,27 @@ fn encode_stage(
             let end_copies = ((pct / 15) + 8).clamp(8, 32);
             for _ in 0..end_copies {
                 let end_hdr = mod_frame_encode(&hdr);
-                let _ = tx.send(end_hdr);
+                ok &= tx.send(end_hdr).is_ok();
             }
         }
     }
+    ok
 }
 
-fn tx_worker(rx: Receiver<Vec<u8>>, mut file: File, baud: u64) {
+fn tx_worker(rx: Receiver<Vec<u8>>, mut file: File, baud: u64) -> bool {
+    // After the first device error keep draining the channel (so producers never block)
+    // but report failure: the caller must not treat the data as sent.
+    let mut ok = true;
     if baud >= 2_500_000 {
         while let Ok(pkt) = rx.recv() {
+            if !ok {
+                continue;
+            }
             for chunk in pkt.chunks(64) {
-                let _ = file.write_all(chunk);
+                if file.write_all(chunk).is_err() {
+                    ok = false;
+                    break;
+                }
                 thread::sleep(Duration::from_micros(150));
             }
             // Inter-frame line recovery time (allows UART to return to idle HIGH)
@@ -541,25 +591,29 @@ fn tx_worker(rx: Receiver<Vec<u8>>, mut file: File, baud: u64) {
     } else {
         let mut batch = Vec::with_capacity(4096);
         while let Ok(pkt) = rx.recv() {
+            if !ok {
+                continue;
+            }
             if batch.len() + pkt.len() > 4096 {
-                let _ = file.write_all(&batch);
+                ok &= file.write_all(&batch).is_ok();
                 batch.clear();
             }
             if pkt.len() > 4096 {
                 if !batch.is_empty() {
-                    let _ = file.write_all(&batch);
+                    ok &= file.write_all(&batch).is_ok();
                     batch.clear();
                 }
-                let _ = file.write_all(&pkt);
+                ok &= file.write_all(&pkt).is_ok();
             } else {
                 batch.extend_from_slice(&pkt);
             }
         }
-        if !batch.is_empty() {
-            let _ = file.write_all(&batch);
+        if ok && !batch.is_empty() {
+            ok &= file.write_all(&batch).is_ok();
         }
     }
     flush_tty(&file);
+    ok
 }
 
 // ----------------------------------------------------------------- RECEIVER
@@ -1157,23 +1211,58 @@ fn send_batch(
     let (tx_tx, tx_rx) = sync_channel::<Vec<u8>>(128);
 
     let h1 = thread::spawn(move || {
-        crawl_and_compress(paths, chunk_size, comp_tx);
+        crawl_and_compress(paths, chunk_size, comp_tx)
     });
 
     let h2 = thread::spawn(move || {
-        encode_stage(comp_rx, tx_tx, pct, rounds);
+        encode_stage(comp_rx, tx_tx, pct, rounds)
     });
 
     let file_clone = dev_file.try_clone().map_err(|e| format!("Failed to clone file descriptor: {}", e))?;
     let h3 = thread::spawn(move || {
-        tx_worker(tx_rx, file_clone, baud);
+        tx_worker(tx_rx, file_clone, baud)
     });
 
-    h1.join().map_err(|_| "Reader thread panicked")?;
-    h2.join().map_err(|_| "Encoder thread panicked")?;
-    h3.join().map_err(|_| "TX thread panicked")?;
+    let skipped = h1.join().map_err(|_| "Reader thread panicked")?;
+    let enc_ok = h2.join().map_err(|_| "Encoder thread panicked")?;
+    let tx_ok = h3.join().map_err(|_| "TX thread panicked")?;
     flush_tty(dev_file);
+    if skipped > 0 {
+        return Err(format!("{} item(s) could not be read or queued", skipped));
+    }
+    if !enc_ok {
+        return Err("encoder could not queue all frames".to_string());
+    }
+    if !tx_ok {
+        return Err("device write failed".to_string());
+    }
     Ok(())
+}
+
+/// (path, len, mtime, inode) of everything under `path`, or None if any part cannot be inspected.
+fn tree_snapshot(path: &Path) -> Option<Vec<(PathBuf, u64, Option<SystemTime>, u64)>> {
+    fn walk(p: &Path, out: &mut Vec<(PathBuf, u64, Option<SystemTime>, u64)>) -> Option<()> {
+        let m = fs::symlink_metadata(p).ok()?;
+        #[cfg(unix)]
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        };
+        #[cfg(not(unix))]
+        let ino = 0u64;
+        out.push((p.to_path_buf(), m.len(), m.modified().ok(), ino));
+        if m.is_dir() {
+            let mut names: Vec<PathBuf> = fs::read_dir(p).ok()?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>().ok()?;
+            names.sort();
+            for c in names {
+                walk(&c, out)?;
+            }
+        }
+        Some(())
+    }
+    let mut v = Vec::new();
+    walk(path, &mut v)?;
+    Some(v)
 }
 
 fn is_file_ready_to_send(path: &Path) -> bool {
@@ -1311,12 +1400,18 @@ pub fn do_send(args: &[String]) -> Result<(), String> {
                 }
 
                 logmsg(&format!("WATCH processing: {}", entry.display()));
+                let before = tree_snapshot(&entry);
                 if let Err(e) = send_batch(vec![entry.clone()], &mut file, baud, chunk_size, pct, rounds) {
                     logmsg(&format!("ERROR sending {}: {}", entry.display(), e));
                     continue;
                 }
 
-                // Delete once transmitted successfully
+                // Delete only if everything was transmitted AND the tree is exactly what was sent:
+                // files added or modified during transmission must survive for the next pass.
+                if before.is_none() || before != tree_snapshot(&entry) {
+                    logmsg(&format!("WATCH changed during send, NOT DELETED: {}", entry.display()));
+                    continue;
+                }
                 if entry.is_dir() && !entry.is_symlink() {
                     let _ = fs::remove_dir_all(&entry);
                 } else {
