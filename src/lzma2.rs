@@ -9,11 +9,32 @@ pub fn compress_lzma2(src: &[u8], _level: i32) -> Result<Vec<u8>, &'static str> 
     Ok(output)
 }
 
+/// Writer that refuses to grow past `limit` bytes, so a malicious stream cannot
+/// expand beyond the size the (already validated) header declared.
+struct CappedWriter {
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() > self.limit - self.buf.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "decompressed output exceeds declared size"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn decompress_lzma2(src: &[u8], expected_size: usize) -> Result<Vec<u8>, &'static str> {
     let mut input = Cursor::new(src);
-    let mut output = Vec::with_capacity(expected_size);
+    // Never pre-allocate more than 64 MiB on the strength of an untrusted size.
+    let mut output = CappedWriter { buf: Vec::with_capacity(expected_size.min(64 << 20)), limit: expected_size };
     lzma_rs::lzma_decompress(&mut input, &mut output).map_err(|_| "Pure Rust LZMA decompression failed")?;
-    Ok(output)
+    Ok(output.buf)
 }
 
 

@@ -26,6 +26,13 @@ use mod_codec::{mod_frame_decode, mod_frame_encode};
 use raptorq::{RaptorQDecoder, RaptorQEncoder};
 use serial::{auto_chunk_size, flush_tty, open_line_recv, open_line_send};
 
+// Receiver-side header limits (SECURITY_AUDIT F-01..F-03). The wire format is unchanged;
+// these only reject headers no compliant sender produces.
+const MAX_CSZ: u64 = 32 * 1024; // symbols must fit in one frame (mod_frame_decode caps frames at ~64 KiB)
+const MAX_PSIZE: u64 = 1 << 30; // payload bytes on the wire per file
+const MAX_SIZE: u64 = 4 << 30; // uncompressed bytes per file
+const MAX_LZMA_RATIO: u64 = 8192; // LZMA cannot exceed ~7000:1; anything above is a bomb
+
 static STOP_FLAG: AtomicBool = AtomicBool::new(false);
 static TRANSFER_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -808,6 +815,32 @@ impl ReceiverContext {
         self.ndone += 1;
     }
 
+    /// Returns the reason a header must be refused, or None if its sizes are coherent.
+    fn header_problem(ftype: char, size: u64, psize: u64, csz: u32, meth: u8, mt_ns: u32) -> Option<&'static str> {
+        if mt_ns >= 1_000_000_000 {
+            return Some("mtime_nsec out of range");
+        }
+        if ftype != 'f' {
+            return if size != 0 || psize != 0 { Some("non-file with data size") } else { None };
+        }
+        if meth > 1 {
+            return Some("unknown compression method");
+        }
+        if size > MAX_SIZE || psize > MAX_PSIZE {
+            return Some("size limit exceeded");
+        }
+        if meth == 0 && size != psize {
+            return Some("stored size mismatch");
+        }
+        if meth == 1 && (psize == 0 || size > psize.saturating_mul(MAX_LZMA_RATIO)) {
+            return Some("implausible compression ratio");
+        }
+        if psize > 0 && (csz == 0 || csz as u64 > MAX_CSZ) {
+            return Some("symbol size out of range");
+        }
+        None
+    }
+
     fn on_header(&mut self, p: &[u8]) {
         if p.len() < 8 + 1 + 12 + 8 + 4 + 8 + 8 + 4 + 4 + 2 + 1 + 1 + 4 + 2 {
             return;
@@ -887,6 +920,10 @@ impl ReceiverContext {
         if (ftype != 'f' && ftype != 'd' && ftype != 'l') || path.is_empty() {
             return;
         }
+        if let Some(why) = Self::header_problem(ftype, size, psize, csz, meth, mt_ns) {
+            logmsg(&format!("REJECT header {}: {}", hex::encode(id), why));
+            return;
+        }
 
         f.ftype = ftype;
         f.mode = mode;
@@ -918,7 +955,13 @@ impl ReceiverContext {
 
         let mut ready = false;
         if ftype == 'f' && psize > 0 {
-            let mut dec = RaptorQDecoder::new(psize as usize, csz as usize).unwrap();
+            let mut dec = match RaptorQDecoder::new(psize as usize, csz as usize) {
+                Some(d) => d,
+                None => {
+                    f.has_hdr = false;
+                    return;
+                }
+            };
             let early = std::mem::take(&mut f.early_syms);
             for es in early {
                 if es.csz == f.csz {
@@ -1618,3 +1661,6 @@ mod security_tests {
         assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o7000, 0);
     }
 }
+
+#[cfg(test)]
+mod audit_regressions;
