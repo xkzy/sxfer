@@ -12,7 +12,7 @@ mod service;
 mod tray_windows;
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,7 @@ use crc32::{crc32_file, Crc32};
 use lzma2::{compress_lzma2, decompress_lzma2};
 use mod_codec::{mod_frame_decode, mod_frame_encode};
 use raptorq::{RaptorQDecoder, RaptorQEncoder};
-use serial::{auto_chunk_size, flush_tty, open_line_recv, open_line_send};
+use serial::{auto_chunk_size, open_line_recv, open_line_send};
 
 // Receiver-side limits (SECURITY_AUDIT F-01..F-08).
 const MIN_CSZ: u64 = 1;
@@ -763,7 +763,7 @@ fn encode_stage(
     ok
 }
 
-fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut File, baud: u64) -> bool {
+fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut (dyn std::io::Write + Send), baud: u64) -> bool {
     // After the first device error keep draining the channel (so producers never block)
     // but report failure: the caller must not treat the data as sent.
     let mut ok = true;
@@ -773,7 +773,8 @@ fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut File, baud: u64) -> bool {
                 continue;
             }
             for chunk in pkt.chunks(64) {
-                if file.write_all(chunk).is_err() {
+                if let Err(e) = file.write_all(chunk) {
+                    eprintln!("DEBUG: write_all failed: {}", e);
                     ok = false;
                     break;
                 }
@@ -789,24 +790,37 @@ fn tx_worker(rx: Receiver<Vec<u8>>, file: &mut File, baud: u64) -> bool {
                 continue;
             }
             if batch.len() + pkt.len() > 4096 {
-                ok &= file.write_all(&batch).is_ok();
+                if let Err(e) = file.write_all(&batch) {
+                    eprintln!("DEBUG: write_all (batch) failed: {}", e);
+                    ok = false;
+                }
                 batch.clear();
             }
             if pkt.len() > 4096 {
                 if !batch.is_empty() {
-                    ok &= file.write_all(&batch).is_ok();
+                    if let Err(e) = file.write_all(&batch) {
+                        eprintln!("DEBUG: write_all (batch before big) failed: {}", e);
+                        ok = false;
+                    }
                     batch.clear();
                 }
-                ok &= file.write_all(&pkt).is_ok();
+                if let Err(e) = file.write_all(&pkt) {
+                    eprintln!("DEBUG: write_all (big pkt) failed: {}", e);
+                    ok = false;
+                }
             } else {
                 batch.extend_from_slice(&pkt);
             }
         }
         if ok && !batch.is_empty() {
-            ok &= file.write_all(&batch).is_ok();
+            if let Err(e) = file.write_all(&batch) {
+                eprintln!("DEBUG: write_all (final batch) failed: {}", e);
+                ok = false;
+            }
         }
     }
-    flush_tty(&file);
+    let _ = file.flush();
+    std::thread::sleep(Duration::from_millis(60));
     ok
 }
 
@@ -1938,7 +1952,7 @@ fn print_usage(prog: &str) {
 
 fn send_batch(
     paths: Vec<PathBuf>,
-    dev_file: &mut File,
+    dev_file: &mut (dyn std::io::Write + Send),
     baud: u64,
     chunk_size: usize,
     pct: usize,
@@ -2222,7 +2236,7 @@ pub fn do_send(args: &[String]) -> Result<(), String> {
                 let before = tree_snapshot(&entry);
                 if let Err(e) = send_batch(
                     vec![entry.clone()],
-                    &mut file,
+                    &mut *file,
                     baud,
                     chunk_size,
                     pct,
@@ -2269,7 +2283,7 @@ pub fn do_send(args: &[String]) -> Result<(), String> {
         dev, baud, chunk_size
     ));
 
-    send_batch(paths, &mut file, baud, chunk_size, pct, rounds, sign_key)?;
+    send_batch(paths, &mut *file, baud, chunk_size, pct, rounds, sign_key)?;
     logmsg("FINISHED");
     Ok(())
 }
