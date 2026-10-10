@@ -7,6 +7,7 @@ mod ldpc;
 mod lzma2;
 mod mod_codec;
 mod raptorq;
+mod scpfwd;
 mod serial;
 mod service;
 mod tray_windows;
@@ -427,6 +428,13 @@ fn crawl_and_compress(
     let mut raw_datas = Vec::new();
 
     for path in paths {
+        // Store names relative to the argument's parent (`out/a.dat` -> `a.dat`, `out/` -> `out/...`).
+        // Bare `.`/`..` have no name of their own, so they keep sending their contents as-is.
+        let path = if path.file_name().is_some() {
+            std::path::absolute(&path).unwrap_or(path)
+        } else {
+            path
+        };
         let root = path.clone();
         let walker = walkdir(&path, &mut problems);
         for entry in walker {
@@ -442,6 +450,9 @@ fn crawl_and_compress(
                     .to_string()
             };
 
+            // Wire format uses '/'; a Windows sender must not leak '\\' into stored names.
+            #[cfg(windows)]
+            let rel = rel.replace('\\', "/");
             let clean_rel = rel
                 .trim_start_matches('/')
                 .trim_start_matches("./")
@@ -2320,6 +2331,7 @@ pub fn do_recv(args: &[String]) -> Result<(), String> {
     let mut require_auth = false;
     let mut replay_cache_path: Option<PathBuf> = None;
     let mut max_clock_skew_secs = auth::DEFAULT_MAX_CLOCK_SKEW_SECS;
+    let mut scp_target: Option<scpfwd::ScpTarget> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -2338,7 +2350,13 @@ pub fn do_recv(args: &[String]) -> Result<(), String> {
             }
             "-o" => {
                 i += 1;
-                out_dir = PathBuf::from(args.get(i).ok_or("-o requires out dir")?);
+                let o = args.get(i).ok_or("-o requires out dir")?;
+                if scpfwd::looks_like_scp(o) {
+                    // `-o [user@]host:/dir`: stage in ./recv, forward each verified file, delete local copy
+                    scp_target = Some(scpfwd::ScpTarget::parse(o)?);
+                } else {
+                    out_dir = PathBuf::from(o);
+                }
             }
             "-q" => {
                 i += 1;
@@ -2377,7 +2395,9 @@ pub fn do_recv(args: &[String]) -> Result<(), String> {
                 eprintln!("Usage: sxfer recv [options]\n\
                            -d DEV              serial device or file (default /dev/ttyUSB0)\n\
                            -b BAUD             baud rate (default 115200)\n\
-                           -o DIR              output directory (default ./recv)\n\
+                           -o DIR              output directory (default ./recv), or [USER@]HOST:DIR to\n\
+                                               forward each verified file with scp and delete the local\n\
+                                               copy (needs key-based ssh login; stages in ./recv)\n\
                            -q SEC              quit SEC seconds after quiet (default: 0 = loop indefinitely)\n\
                            -p                  restore owner/group (requires root)\n\
                            --verify-key PATH   trusted Ed25519 public key file for signature verification\n\
@@ -2440,6 +2460,8 @@ pub fn do_recv(args: &[String]) -> Result<(), String> {
             canon_out.display()
         ));
     }
+
+    let forwarder = scp_target.map(|t| scpfwd::Forwarder::start(t, canon_out.clone()));
 
     let mut in_buf = Vec::with_capacity(1 << 20);
     let mut read_buf = [0u8; 65536];
@@ -2561,6 +2583,9 @@ pub fn do_recv(args: &[String]) -> Result<(), String> {
     }
 
     ctx.finish();
+    if let Some(f) = forwarder {
+        f.finish();
+    }
     Ok(())
 }
 
