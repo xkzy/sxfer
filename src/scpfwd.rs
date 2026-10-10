@@ -7,7 +7,7 @@
 //! A file is deleted locally only after `scp` exits successfully.
 
 use crate::logmsg;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -101,25 +101,21 @@ fn rel_string(base: &Path, p: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// File names come from the (untrusted) sender and legacy scp hands the remote
-/// path to the remote shell, so only forward names that are inert there.
-/// Quoting is not an option: SFTP-mode scp would keep the quotes literally.
+/// File names come from the (untrusted) sender. The remote path is single-quoted
+/// for the remote shell, so the only names refused are ones with control characters
+/// (log/terminal spoofing, NUL), backslashes (ambiguous across platforms), or
+/// `.`/`..`/empty components.
 fn is_safe_rel(rel: &str) -> bool {
     !rel.is_empty()
-        && rel.split('/').all(|c| {
-            !c.is_empty()
-                && c != "."
-                && c != ".."
-                && c.chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+' | '=' | ',' | '@'))
-        })
+        && rel
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != ".." && !c.chars().any(|ch| ch.is_control() || ch == '\\'))
 }
 
 const UNSAFE_PREFIX: &str = "unsafe file name";
 
 fn run(cmd: &mut Command) -> Result<(), String> {
     let out = cmd
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
@@ -131,32 +127,69 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     }
 }
 
-fn forward_one(
-    target: &ScpTarget,
-    base: &Path,
-    file: &Path,
-    made: &mut HashSet<String>,
-) -> Result<String, String> {
+/// Open `file` for streaming without ever following a symlink swapped in after the scan.
+/// The handle is accepted only if, once open, the path is still a plain regular file
+/// that is the very same file (device+inode on Unix) as the handle.
+fn open_regular(file: &Path) -> Result<fs::File, String> {
+    let before = fs::symlink_metadata(file).map_err(|e| e.to_string())?;
+    if !before.file_type().is_file() {
+        return Err("not a regular file (symlink or special)".to_string());
+    }
+    let f = fs::File::open(file).map_err(|e| e.to_string())?;
+    let opened = f.metadata().map_err(|e| e.to_string())?;
+    let after = fs::symlink_metadata(file).map_err(|e| e.to_string())?;
+    let same = opened.is_file() && after.file_type().is_file() && {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            opened.dev() == after.dev() && opened.ino() == after.ino()
+        }
+        #[cfg(not(unix))]
+        {
+            opened.len() == after.len()
+        }
+    };
+    if same {
+        Ok(f)
+    } else {
+        Err("file changed or was replaced while opening".to_string())
+    }
+}
+
+/// Quote a remote path for a POSIX shell, keeping `~` working (single quotes would disable it).
+fn sh_path(p: &str) -> String {
+    if p == "~" {
+        "\"$HOME\"".to_string()
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        format!("\"$HOME\"/{}", sh_quote(rest))
+    } else {
+        sh_quote(p)
+    }
+}
+
+/// Stream the file over `ssh host 'cat > tmp && mv tmp dest'`: the destination is quoted
+/// explicitly (no scp protocol / remote-shell guessing) and appears atomically.
+fn forward_one(target: &ScpTarget, base: &Path, file: &Path) -> Result<String, String> {
     let rel = rel_string(base, file).ok_or("path outside output dir")?;
     if !is_safe_rel(&rel) {
-        return Err(format!(
-            "{} (allowed: A-Z a-z 0-9 . _ - + = , @)",
-            UNSAFE_PREFIX
-        ));
+        return Err(format!("{} (control characters, backslash, or '..')", UNSAFE_PREFIX));
     }
     let remote = target.remote_path(&rel);
-    let remote_parent = remote.rsplit_once('/').map_or(".", |(p, _)| if p.is_empty() { "/" } else { p });
-    if !made.contains(remote_parent) {
-        run(Command::new("ssh")
-            .args(["-o", "BatchMode=yes", "--"])
-            .arg(&target.host)
-            .arg(format!("mkdir -p -- {}", sh_quote(remote_parent))))?;
-        made.insert(remote_parent.to_string());
-    }
-    run(Command::new("scp")
-        .args(["-q", "-o", "BatchMode=yes", "--"])
-        .arg(file)
-        .arg(format!("{}:{}", target.host, remote)))?;
+    let (dir, _) = remote.rsplit_once('/').unwrap_or((".", ""));
+    let dir = if dir.is_empty() { "/" } else { dir };
+    let tmp = format!("{}.sxfer-part", remote);
+    let script = format!(
+        "umask 077; mkdir -p -- {dir} && cat > {tmp} && mv -f -- {tmp} {dst}",
+        dir = sh_path(dir),
+        tmp = sh_path(&tmp),
+        dst = sh_path(&remote)
+    );
+    let input = open_regular(file)?;
+    run(Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "--"])
+        .arg(&target.host)
+        .arg(script)
+        .stdin(Stdio::from(input)))?;
     Ok(remote)
 }
 
@@ -179,7 +212,6 @@ fn pass(
     target: &ScpTarget,
     base: &Path,
     retry_at: &mut HashMap<PathBuf, Instant>,
-    made: &mut HashSet<String>,
     final_pass: bool,
 ) -> usize {
     let mut files = Vec::new();
@@ -197,7 +229,7 @@ fn pass(
                 continue;
             }
         }
-        match forward_one(target, base, &f, made) {
+        match forward_one(target, base, &f) {
             Ok(remote) => {
                 retry_at.remove(&f);
                 let shown = rel_string(base, &f).unwrap_or_default();
@@ -209,7 +241,6 @@ fn pass(
                 }
             }
             Err(e) => {
-                made.clear(); // remote dir may have vanished or the host changed
                 let skip = e.starts_with(UNSAFE_PREFIX);
                 logmsg(&format!(
                     "SCP   {} {} (kept locally{}): {}",
@@ -248,13 +279,12 @@ impl Forwarder {
         let d = done.clone();
         let handle = thread::spawn(move || {
             let mut retry_at = HashMap::new();
-            let mut made = HashSet::new();
             while !d.load(Ordering::Relaxed) {
-                pass(&target, &out_dir, &mut retry_at, &mut made, false);
+                pass(&target, &out_dir, &mut retry_at, false);
                 thread::sleep(Duration::from_millis(500));
             }
             // Receiver finished: flush everything left, ignoring settle/backoff.
-            let left = pass(&target, &out_dir, &mut retry_at, &mut made, true);
+            let left = pass(&target, &out_dir, &mut retry_at, true);
             if left > 0 {
                 logmsg(&format!("SCP   {} file(s) NOT forwarded, left in {}", left, out_dir.display()));
             }
@@ -296,10 +326,35 @@ mod tests {
 
     #[test]
     fn safe_names() {
-        assert!(is_safe_rel("a/b-c_d.1+x=y,z@h"));
-        for bad in ["", "a b", "a;b", "a`b`", "$(x)", "a'b", "../x", "a//b", "./a", "-x/..", "a\\b", "a\nb", "a|b", "é"] {
+        for ok in ["a/b-c_d.1+x=y,z@h", "a b", "x;touch p", "a`b`", "$(x)", "a'b", "é"] {
+            assert!(is_safe_rel(ok), "{:?}", ok);
+        }
+        for bad in ["", "../x", "a//b", "./a", "a/..", "a\\b", "a\nb", "a\u{1b}[2J", "a\0b"] {
             assert!(!is_safe_rel(bad), "{:?}", bad);
         }
+    }
+
+    #[test]
+    fn remote_path_quoting() {
+        assert_eq!(sh_path("/in/a b"), "'/in/a b'");
+        assert_eq!(sh_path("~/in/x'y"), r#""$HOME"/'in/x'\''y'"#);
+        assert_eq!(sh_path("~"), "\"$HOME\"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_refuses_symlinks() {
+        let d = std::env::temp_dir().join(format!("sxfer-scpfwd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let secret = d.join("secret");
+        fs::write(&secret, b"s").unwrap();
+        fs::write(d.join("plain"), b"p").unwrap();
+        std::os::unix::fs::symlink(&secret, d.join("link")).unwrap();
+        assert!(open_regular(&d.join("plain")).is_ok());
+        assert!(open_regular(&d.join("link")).is_err());
+        assert!(open_regular(&d).is_err());
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
